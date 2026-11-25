@@ -37,7 +37,7 @@ target_link_libraries(mission_input PUBLIC ${LIBXML2_LIBRARIES})
 # Livox SDK2 作为子工程编译；EXCLUDE_FROM_ALL 避免无引用时连带构建其样例与工具。
 add_subdirectory(${LIVOX_SDK2_DIR}/sdk_core ${CMAKE_CURRENT_BINARY_DIR}/livox_sdk2 EXCLUDE_FROM_ALL)
 # 机载主程序：串口/MAVLink、EGO 规划适配、配置加载与 Livox 点云链路合并为单一可执行文件。
-add_executable(onboard_main src/onboard_main.cpp src/error_log.cpp src/offboard_pilot.cpp src/ego_planner_adapter.cpp src/serial_port.cpp src/config_file.cpp src/livox_source.cpp ${CORE_SRC} ${SENSOR_SRC} ${SENSOR_DIR}/src/livox_parser.cpp ${SENSOR_DIR}/src/frame_assembler.cpp)
+add_executable(onboard_main src/onboard_main.cpp src/error_log.cpp src/record_writer.cpp src/offboard_pilot.cpp src/ego_planner_adapter.cpp src/serial_port.cpp src/config_file.cpp src/livox_source.cpp ${CORE_SRC} ${SENSOR_SRC} ${SENSOR_DIR}/src/livox_parser.cpp ${SENSOR_DIR}/src/frame_assembler.cpp)
 target_include_directories(onboard_main PRIVATE ${LIVOX_SDK2_DIR}/3rdparty ${LIVOX_SDK2_DIR}/sdk_core)
 # livox_lidar_sdk_static 为 SDK2 的静态库目标；pthread 供串口与雷达接收线程使用。
 target_link_libraries(onboard_main mission_input yaml-cpp pthread livox_lidar_sdk_static)
@@ -52,8 +52,6 @@ if(BUILD_TESTING)
   add_executable(mission_inbox_selftest test/mission_inbox_selftest.cpp)
   target_link_libraries(mission_inbox_selftest mission_input)
   add_test(NAME mission_inbox_selftest COMMAND mission_inbox_selftest)
-  # KML 解析冒烟：--prepare-only 不连飞控、不启动规划。
-  add_test(NAME kml_prepare_only COMMAND onboard_main --prepare-only --kml ${CMAKE_CURRENT_SOURCE_DIR}/test/data/short_route.kml --config ${CMAKE_CURRENT_SOURCE_DIR}/config/onboard.yaml)
   # 装有 Python3 时才注册端到端用例（以子进程驱动主程序）。
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)

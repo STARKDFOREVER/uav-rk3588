@@ -1,8 +1,6 @@
 // 本地 KML 任务输入：等待文件出现 -> 读取 -> 解析第一条 LineString -> 固定高度航线。
-// 解析使用 libxml2 的内存解析，禁用网络与实体展开（XML_PARSE_NONET），
-// 拒绝含 DTD 的文档，避免 XXE 与外部实体攻击。
-// 坐标约定：KML 的 tuple 为 "lon,lat,alt"（经度在前），只取经纬度，
-// 内部统一转成 GeoWaypoint 的 (lat, lon, constant_alt_m)，高度由配置固定给出。
+// 文件由本机地面站投递，按可信输入解析；坐标约定：KML 的 tuple 为 "lon,lat,alt"（经度在前），
+// 只取经纬度，内部统一转成 GeoWaypoint 的 (lat, lon, constant_alt_m)，高度由配置固定给出。
 // 所有数量上限（max_waypoints / max_bytes）都按上限值传入各层，避免大文件耗尽内存。
 #include "onboard/mission_input.h"
 #include "onboard/route_utils.h"
@@ -78,10 +76,9 @@ namespace ego_onboard
       if (!coordinate_node) { error = "KML geometry has no coordinates"; return false; }
       std::istringstream input(content(coordinate_node));
       std::string token;
-      std::size_t tuples = 0;
+      const std::size_t start = result.size();
       while (input >> token)
       {
-        ++tuples;
         // 按逗号切分 tuple：2 或 3 个字段（经度、纬度、可选高度）
         std::vector<std::string> fields;
         std::size_t offset = 0;
@@ -101,7 +98,7 @@ namespace ego_onboard
         if (result.size() >= limit) { error = "KML has too many coordinates"; return false; }
         result.push_back(sample);
       }
-      if (tuples == 0) { error = "KML coordinates are empty"; return false; }
+      if (result.size() == start) { error = "KML coordinates are empty"; return false; }
       return true;
     }
     // 递归找文档中第一条 LineString 的坐标；Point / MultiGeometry 一律忽略。
@@ -122,11 +119,11 @@ namespace ego_onboard
       return true;
     }
     // 配置合法性前置校验：上限必须是正数且不超过 INT_MAX（libxml2 用 int 表示长度）；
-    // max_waypoints 至少 2（起飞点 + 至少一个导航点），上限 65533 与飞控航点协议容量对齐。
+    // max_waypoints 至少 2（起飞点 + 至少一个导航点），实际规模由 max_bytes 兜底。
     bool configValid(const MissionInputConfig &c, std::string &error)
     {
       if (c.max_bytes == 0 || c.max_bytes > static_cast<std::size_t>(INT_MAX) ||
-          c.max_waypoints < 2 || c.max_waypoints > 65533 ||
+          c.max_waypoints < 2 ||
           !std::isfinite(c.min_alt_m) || !std::isfinite(c.max_alt_m) ||
           c.min_alt_m < 0 || c.max_alt_m <= c.min_alt_m)
       { error = "Invalid mission_input limits"; return false; }
@@ -189,19 +186,17 @@ namespace ego_onboard
     if (!configValid(config, error)) return false;
     if (xml.empty() || xml.size() > config.max_bytes)
     { error = "KML is empty or exceeds max_bytes"; return false; }
-    // NONET 禁止网络加载，NOBLANKS 去掉纯空白节点；后续再显式拒绝 DTD/外部子集。
+    // 本地可信输入：直接按 KML 解析，不做网络加载或实体展开相关限制。
     std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> doc(
         xmlReadMemory(xml.data(), static_cast<int>(xml.size()), "mission.kml", nullptr,
-                      XML_PARSE_NONET | XML_PARSE_NOBLANKS | XML_PARSE_NOERROR | XML_PARSE_NOWARNING), xmlFreeDoc);
-    if (!doc || doc->intSubset || doc->extSubset || !named(xmlDocGetRootElement(doc.get()), "kml"))
-    { error = "Expected valid KML XML without DTD / external entities"; return false; }
+                      XML_PARSE_NOERROR | XML_PARSE_NOWARNING), xmlFreeDoc);
+    if (!doc || !named(xmlDocGetRootElement(doc.get()), "kml"))
+    { error = "Expected valid KML XML"; return false; }
     std::vector<Sample> points;
     bool found = false;
     if (!firstLineString(xmlDocGetRootElement(doc.get()), config.max_waypoints, points, found, error))
       return false;
     if (!found) { error = "KML has no LineString route"; return false; }
-    if (points.empty() || points.size() > config.max_waypoints)
-    { error = "KML has no route or too many waypoints"; return false; }
     // 高度全程固定为配置值（configValid 已保证落在允许范围内）。
     for (const auto &sample : points)
       mission.route.push_back({sample.lat, sample.lon, config.constant_alt_m});

@@ -1,15 +1,4 @@
 // EgoPlannerAdapter 自检
-// 用"合成激光帧 + 合成位姿"喂适配器，看它是不是真的：
-//   1) 把点云建成占据栅格（insert-only）；
-//   2) 生成并跟踪一条避障轨迹；
-//   3) 命令始终落在自由空间（不撞）；
-//   4) 绕开障碍后回到参考航线并到达本段终点；
-//   5) 位姿覆盖不足时整帧丢弃（绝不拿错位姿污染 insert-only 地图）。
-//
-// 运行方式：ego_adapter_selftest <onboard.yaml>
-//   argv[1] 为生产配置，既用于校验真实安全间距参数，也用于最后的高速长航段场景。
-// 退出码：0 全部断言通过；1 存在断言失败；2 参数个数不对。
-// 所有时间轴、位姿和点云均为合成数据，不开启任何设备。
 
 #include <algorithm>
 #include <cmath>
@@ -171,7 +160,7 @@ int main(int argc, char **argv)
     pose.q = Eigen::Quaterniond::Identity();
     a2.onPose(pose);
 
-    // 先跑一拍把图建起来（图要等"开始导航那一帧"才建，之前 onScanFrame 会被忽略）
+    // 先跑一拍把图建起来
     ego_planner::QuadrotorCommand c2;
     a2.step(0.0, start, c2);
     check(a2.mapReady(), "建图完成（第一次 step 之后）");
@@ -189,8 +178,7 @@ int main(int argc, char **argv)
     check(a3.step(0.0, start, cmd) && cmd.velocity.norm() == 0.0, "无航线时输出悬停指令");
   }
 
-  // ---- 高度带基准 = 开始导航那一帧的实际高度（不是写死的常数）----
-  {
+  // 高度带基准 = 开始导航那一帧的实际高度
     EgoPlannerAdapter a4;
     a4.init(cfg);
     check(!a4.mapReady(), "init() 之后还没建图（要等开始导航那一帧）");

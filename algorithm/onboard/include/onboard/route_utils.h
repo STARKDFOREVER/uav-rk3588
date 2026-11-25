@@ -2,6 +2,7 @@
 #define ONBOARD_ROUTE_UTILS_H
 
 #include <cmath>
+#include <limits>
 #include <string>
 #include "onboard/offboard_pilot.h"
 
@@ -40,6 +41,12 @@ namespace ego_onboard
       added = true;
     }
     return true;
+  }
+
+  // 不设航点数上限的版本：容量由解析阶段按配置约束，这里只保证首尾闭合。
+  inline bool ensureReturnToStart(std::vector<GeoWaypoint> &route, bool &added, std::string &error)
+  {
+    return ensureReturnToStart(route, std::numeric_limits<std::size_t>::max(), added, error);
   }
 }
 #endif

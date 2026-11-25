@@ -41,8 +41,6 @@ mission:
   # 航点水平到达判定半径（m）。
   wp_reach_tol: 2.0
   pre_offboard_stream_s: 1.5  # 稳定悬停后预发 setpoint，再请求切换
-  # true 使用 EGO 规划器输出；false 时不调用规划器、保持悬停（调试用）。
-  use_planner: true
 
 # 报文提频（协议 2.5.1，req_stream_id = 报文 ID）
 streaming:

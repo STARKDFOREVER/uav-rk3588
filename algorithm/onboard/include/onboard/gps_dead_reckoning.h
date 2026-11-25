@@ -75,11 +75,6 @@ namespace ego_onboard
       return true;
     }
 
-    // 是否已经有锚点（至少拿到过一次有效定位）
-    bool hasAnchor() const { return have_; }
-    // 自锚点起的 ENU 累计位移（米）
-    const Eigen::Vector3d &offset() const { return offset_; }
-
   private:
     GeoFix anchor_;                                    // 最后一帧有效定位
     Eigen::Vector3d offset_ = Eigen::Vector3d::Zero(); // 自锚点起的 ENU 位移

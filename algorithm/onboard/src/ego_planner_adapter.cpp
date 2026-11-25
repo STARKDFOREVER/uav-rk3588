@@ -42,25 +42,32 @@ namespace ego_onboard
     route_total_ = 0.0;
     leg_last_ = false;
 
-    // 轨迹、命令、定时全部归零
-    invalidateTrajectory();
-    have_cmd_ = false;
-
-    pose_buf_ = ego_sensor::PoseBuffer();
+    // 轨迹、命令、位姿缓冲全部归零
+    resetControl();
+    resetPoseBuffer();
     last_recenter_.setZero();
 
     stats_ = Stats();
     last_scan_time_ = -1e9;
-    pose_buf_.setStrictCoverage(cfg_.strict_pose_coverage);
   }
 
   // 时钟不连续：位姿的绝对时间已不可信，清空位姿缓冲并丢弃当前轨迹。
   // 栅格地图保持不动——已插入的点都是世界系坐标，与时间映射无关。
   void EgoPlannerAdapter::clearPoseHistory() {
     std::lock_guard<std::mutex> lk(mtx_);
+    resetPoseBuffer();
+    last_scan_time_ = -1e9;
+    resetControl();
+  }
+
+  // 清空位姿缓冲；严格覆盖开关随 cfg_ 一起恢复
+  void EgoPlannerAdapter::resetPoseBuffer() {
     pose_buf_ = ego_sensor::PoseBuffer();
     pose_buf_.setStrictCoverage(cfg_.strict_pose_coverage);
-    last_scan_time_ = -1e9;
+  }
+
+  // 作废轨迹并清掉待发命令
+  void EgoPlannerAdapter::resetControl() {
     invalidateTrajectory();
     have_cmd_ = false;
   }
@@ -137,8 +144,7 @@ namespace ego_onboard
     scan_asm_.setExtrinsic(cfg_.extrinsic);
 
     // 轨迹状态清零
-    invalidateTrajectory();
-    have_cmd_ = false;
+    resetControl();
   }
 
   // 航段

@@ -17,10 +17,10 @@ inline double unixSeconds() {
 }
 // TIMESYNC mid-point estimator. Receive timestamps are NEVER used as sample times.
 // RTT/2 is an estimated uncertainty bound, assuming a responsive peer clock.
-// 偏差 = 本机发送/接收时刻的中点 - 飞控回带的时间戳；样本做 0.9/0.1 低通，
-// 残差超限即认为发生跳变，清空后重新累积。
+// 偏差 = 本机发送/接收时刻的中点 - 飞控回带的时间戳；样本做 0.9/0.1 低通。
 // 拒绝策略：请求标识不匹配、RTT 越界、残差越界、样本超时，都只累加 rejected_ 并丢弃
-// 本次样本，不污染既有估计；reset() 让 generation 自增，通知使用方旧映射已失效。
+// 本次样本；残差越界不清空既有估计（真实时钟阶跃由飞控 boot 时钟回退或 EpochBridge 识别）。
+// reset() 让 generation 自增，通知使用方旧映射已失效。
 class TimeAlignment {
  public:
   // 样本采纳门限：往返时延上限、与当前估计的最大残差、样本有效期（秒）
@@ -44,9 +44,10 @@ class TimeAlignment {
     if (samples_ && now-last_ > timeout_s) reset();
     // 偏差估计 = 本机收发中点 - 飞控时间戳（tc1 为纳秒，转为秒）
     const double measured = (sent_ + now) * 0.5 - double(tc1) * 1e-9;
-    // 校验 3：与当前估计偏差过大，判为时钟跳变，清空重建而不是硬融
+    // 校验 3：与当前估计偏差过大说明该样本不可信，只丢弃、不重置估计。
+    // 低通本身能吸收孤立野值；真正的时钟阶跃由飞控 boot 回退或 EpochBridge 负责识别。
     if (samples_ && std::abs(measured - offset_) > max_residual_s) {
-      reset(); ++rejected_; return false;
+      ++rejected_; return false;
     }
     residual_ = samples_ ? std::abs(measured - offset_) : 0;
     // 首个样本直接取用；之后 0.9/0.1 低通，抑制单次抖动又不至于跟不上缓慢漂移
@@ -61,7 +62,6 @@ class TimeAlignment {
   // 本机单调时钟 -> 飞控 time_boot_ms（用于发给飞控的时间字段）
   // 与 hostTime 共用同一 offset_，符号在减法里体现；负值被 max(0.0, …) 夹到 0
   uint32_t bootMs(double now) const { return uint32_t(uint64_t(std::llround(std::max(0.0, (now - offset_) * 1000)))); }
-  double offset() const { return offset_; }
   double rtt() const { return rtt_; }
   double residual() const { return residual_; }
   int samples() const { return samples_; }

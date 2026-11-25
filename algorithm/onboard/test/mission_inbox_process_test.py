@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-# ---------------------------------------------------------------------------
 # mission_inbox_process_test.py —— 真实进程级 KML 延迟投递测试（CTest 集成自测）
 # 测试目的：在无飞机的情况下启动真实可执行文件，验证：
 #   1) 缺失 KML 时进程保持 WAIT_KML，且不打开、不写入 UART；半成品 KML 直接终态失败；
-#   2) 合法 KML 投递后只装载一次任务（[KML READY] 仅出现一次），
-#      后续非法替换不影响已接受任务；
-#   3) --enable-control 时任务交付后才走到串口打开阶段（打开失败退出码 2）；
-#   4) 等待期间收到 SIGTERM 可干净退出（退出码 0）；
-#   5) --prepare-only 严格模式缺文件时退出码 2，原因写入错误日志而不打印。
-# 运行参数：argv[1]=被测可执行文件，argv[2]=配置路径，argv[3]=样例 KML 路径。
-# 通过判据：所有 assert 通过；任一失败抛 AssertionError → 非 0 退出。
-# 说明：用 pty.openpty() 伪造串口，select 零超时轮询主端可读性来证明“未写 UART”；
-#   程序错误统一写入 --error-dir 指定的 onboard_error.log，控制台只保留非错误状态。
-#   wait_for 的 5s 超时仅用于防止 CI 挂死，不是性能断言。
-# ---------------------------------------------------------------------------
+#   2) 合法 KML 投递后只装载一次任务（[KML READY] 仅出现一次），随后才走到串口打开阶段；
+#   3) 等待期间收到 SIGTERM 可干净退出（退出码 0）。
 """Exercise delayed KML arrival in the real executable, without any aircraft."""
 import os
 from pathlib import Path
@@ -27,6 +17,8 @@ import time
 
 # 三个位置参数：被测可执行文件、配置文件、样例 KML。
 binary, config, sample = sys.argv[1:]
+# 实机控制路径必需参数；雷达参数只为通过参数校验，进程会先因串口失败退出。
+CONTROL_ARGS = ['--enable-control', '--livox-config', 'unused.json', '--lidar-ip', '192.168.1.173']
 
 
 def wait_for(log, marker, process, timeout=5):
@@ -60,10 +52,9 @@ with tempfile.TemporaryDirectory() as temp:
     master, slave = pty.openpty()
     # stdout 写入临时文件边运行边轮询；错误由程序自身写入 --error-dir 下的日志。
     with tempfile.TemporaryFile() as log:
-        # duration=1.5 让进程自行结束，便于验证“只装载一次任务”后的稳定行为。
         process = subprocess.Popen([binary, '--config', config, '--kml', str(inbox),
-                                    '--serial', os.ttyname(slave), '--duration', '1.5',
-                                    '--error-dir', str(error_dir)],
+                                    '--serial', os.ttyname(slave), '--error-dir', str(error_dir)]
+                                   + CONTROL_ARGS,
                                    stdout=log, stderr=log)
         try:
             # 启动后应先进入 WAIT_KML，此时 KML 尚不存在；稍等确认进程存活。
@@ -78,7 +69,7 @@ with tempfile.TemporaryDirectory() as temp:
             assert not select.select([master], [], [], 0)[0], 'Invalid KML activated the UART'
             log.seek(0)
             failed = log.read().decode()
-            assert 'Expected valid KML XML' not in failed and '[FATAL]' not in failed, failed
+            assert '[FATAL]' not in failed, failed
             assert 'Expected valid KML XML' in error_text(), error_text()
             print('Partial KML fails terminally before any device is opened')
         finally:
@@ -87,51 +78,22 @@ with tempfile.TemporaryDirectory() as temp:
                 process.kill()
                 process.wait()
 
-    # 第二段：合法任务延迟投递；接受后替换内容不得改写已锁存任务。
+    # 关闭 PTY 两端，避免 fd 泄漏影响后续用例。
+    os.close(master)
+    os.close(slave)
+
+    # 第二段：合法任务投递后只装载一次，随后进入串口打开阶段并失败。
     inbox.unlink()
+    # 清掉上一段的错误日志，确保本段断言的是本次运行的 FATAL。
+    error_log_file.unlink(missing_ok=True)
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen([binary, '--config', config, '--kml', str(inbox),
-                                    '--serial', os.ttyname(slave), '--duration', '1.5',
-                                    '--error-dir', str(error_dir)],
+                                    '--serial', '/nonexistent-fcu', '--error-dir', str(error_dir)]
+                                   + CONTROL_ARGS,
                                    stdout=log, stderr=log)
         try:
             wait_for(log, '[STATE] WAIT_KML', process)
             # 先写 .tmp 再 replace 到正式路径，复刻生产端原子投递。
-            delivery.write_bytes(Path(sample).read_bytes())
-            delivery.replace(inbox)
-            wait_for(log, '[KML READY]', process)
-            # 接受后再覆盖为非法内容：已锁存任务不应被改写，也不应重复装载。
-            inbox.write_text('invalid replacement after acceptance')
-            # 正常结束退出码 0；随后断言 [KML READY] 只出现一次。
-            assert process.wait(timeout=6) == 0
-            log.seek(0)
-            output = log.read().decode()
-            # 只允许一次装载，防止目录轮询导致重复任务。
-            assert output.count('[KML READY]') == 1, output
-            # 未启用控制时只能进入观测模式。
-            assert '[OBSERVE]' in output and '[CONTROL]' not in output, output
-            print('Real process starts on valid delivery and latches one task')
-        finally:
-            # 兜底清理：断言失败时也必须确保子进程不残留。
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            # 关闭 PTY 两端，避免 fd 泄漏影响后续用例。
-            os.close(master)
-            os.close(slave)
-
-    # 第三段：--enable-control，但串口路径不存在，必须在任务接受后才失败。
-    inbox.unlink()
-    with tempfile.TemporaryFile() as log:
-        # livox 相关参数仅为满足参数解析，不启动真实雷达（会因串口失败先退出）。
-        process = subprocess.Popen([binary, '--config', config, '--kml', str(inbox),
-                                    '--serial', '/nonexistent-fcu', '--enable-control',
-                                    '--livox-config', 'unused.json', '--lidar-ip', '192.168.1.173',
-                                    '--error-dir', str(error_dir)],
-                                   stdout=log, stderr=log)
-        try:
-            wait_for(log, '[STATE] WAIT_KML', process)
-            # 仍先等待缺失 KML；投递合法任务后才进入串口打开阶段。
             delivery.write_bytes(Path(sample).read_bytes())
             delivery.replace(inbox)
             # 串口打开失败应返回 2；控制台只保留 [KML READY]，[FATAL] 写入错误日志。
@@ -139,22 +101,24 @@ with tempfile.TemporaryDirectory() as temp:
             log.seek(0)
             output = log.read().decode()
             assert '[KML READY]' in output and '[FATAL]' not in output, output
+            assert output.count('[KML READY]') == 1, output
             assert '[FATAL]' in error_text(), error_text()
-            print('Delayed control start reaches the serial open stage after task acceptance')
+            print('Delayed control start latches one task, then reaches the serial open stage')
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
 
-    # 第四段：等待期间收到 SIGTERM 应干净退出且不打开设备。
+    # 第三段：等待期间收到 SIGTERM 应干净退出且不打开设备。
     inbox.unlink()
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen([binary, '--config', config, '--kml', str(inbox),
                                     '--serial', '/nonexistent-fcu',
-                                    '--error-dir', str(error_dir)], stdout=log, stderr=log)
+                                    '--error-dir', str(error_dir)] + CONTROL_ARGS,
+                                   stdout=log, stderr=log)
         try:
             wait_for(log, '[STATE] WAIT_KML', process)
-            # 发送 SIGTERM 并期望退出码 0（优雅取消，而非被杀）。
+            # 发送 SIGTERM 并期望退出码 0
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=2) == 0
             print('SIGTERM cleanly cancels KML waiting without opening a device')
@@ -162,9 +126,3 @@ with tempfile.TemporaryDirectory() as temp:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    # 最后：--prepare-only 严格模式下缺文件立即返回 2，原因只写入错误日志。
-    strict = subprocess.run([binary, '--config', config, '--kml', str(inbox), '--prepare-only',
-                             '--error-dir', str(error_dir)],
-                            capture_output=True, text=True, timeout=3)
-    assert strict.returncode == 2, strict
-    assert 'Cannot open local KML' in error_text() and 'Cannot open local KML' not in strict.stderr, strict

@@ -123,7 +123,6 @@ namespace ego_onboard
       get(n, "wp_reach_tol", out.pilot.wp_reach_tol);
 
       get(n, "pre_offboard_stream_s", out.pilot.pre_offboard_stream_s);
-      get(n, "use_planner", out.pilot.use_planner);
       // 航线来自启动时解析的本地 KML。
     }
 

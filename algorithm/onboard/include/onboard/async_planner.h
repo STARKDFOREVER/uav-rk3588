@@ -40,7 +40,7 @@ class AsyncPlanner : public PlannerIO {
   // 原始雷达帧入队；只保留最近 3 帧，避免规划跟不上时无界堆积
   void onScanFrame(const ego_sensor::LidarFrame &f) override {
     std::lock_guard<std::mutex> l(m_);
-    if (scans_.size() >= 3) scans_.pop_front(); scans_.push_back(f); wake_.notify_one();
+    if (scans_.size() >= kMaxPendingScans) scans_.pop_front(); scans_.push_back(f); wake_.notify_one();
   }
   // 控制侧每拍调用：命令在 0.15 s 内有效则直接复用；
   // 否则返回 false，并用当前位置填充一个零速度的保底指令。
@@ -66,6 +66,8 @@ class AsyncPlanner : public PlannerIO {
   }
   EgoPlannerAdapter::Stats stats() const { std::lock_guard<std::mutex> l(m_); return stats_; }
  private:
+  // 两级帧缓冲共用上限：待处理帧与待覆盖帧都只保留最近 3 帧
+  static constexpr std::size_t kMaxPendingScans = 3;
   // 工作线程主循环：交换队列 -> 转发航段/位姿 -> 按位姿覆盖顺序消费原始帧
   // -> 推进规划 -> 回写命令与统计（generation 变了就丢弃这一拍的结果）
   void run() {
@@ -91,7 +93,7 @@ class AsyncPlanner : public PlannerIO {
       for (const auto &p:poses) adapter.onPose(p);
       for (auto &f:scans) pending.push_back(std::move(f));
       // 待覆盖帧同样有界：只保留最近 3 帧，超出的旧帧直接丢弃
-      while (pending.size() > 3) pending.pop_front();
+      while (pending.size() > kMaxPendingScans) pending.pop_front();
       const double now=monotonicSeconds();
       // 只把"扫描结束时刻已有位姿覆盖"的帧送进建图；覆盖不足的帧留给下一拍继续等
       while (!pending.empty()) {

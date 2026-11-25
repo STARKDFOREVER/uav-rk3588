@@ -4,9 +4,6 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <chrono>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/tcp.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -35,39 +32,14 @@ namespace ego_onboard
   {
     // 重复 open 等价于重连：先停旧读线程、释放旧描述符
     close();
-    // 前缀 tcp:// 表示串口服务器（TCP 桥接），否则按本地串口设备打开
-    const bool tcp = dev.compare(0, 6, "tcp://") == 0;
-    if (tcp) {
-      // host 与 port 以最后一个冒号分隔（IPv4 地址与主机名本身不含冒号）
-      const auto colon = dev.find_last_of(':');
-      if (colon <= 6 || colon == std::string::npos) { err="expected tcp://host:port"; return false; }
-      const std::string host=dev.substr(6, colon-6), port=dev.substr(colon+1);
-      // 只解析一次地址；失败说明主机名/IP 写错，不重试
-      addrinfo hints{}, *res=nullptr; hints.ai_socktype=SOCK_STREAM;
-      if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res)) { err="TCP bridge address lookup failed"; return false; }
-      // 依次尝试解析出的候选地址；SOCK_NONBLOCK 保证 connect 不阻塞调用线程
-      for (auto *a=res; a; a=a->ai_next) {
-        fd_=::socket(a->ai_family, a->ai_socktype | SOCK_NONBLOCK, a->ai_protocol);
-        if (fd_<0) continue;
-        // connect 返回 EINPROGRESS 时最多等 1 s 完成握手，再用 SO_ERROR 确认是否真连上
-        int rc=::connect(fd_,a->ai_addr,a->ai_addrlen);
-        pollfd pfd{fd_, POLLOUT, 0}; int e=0; socklen_t n=sizeof(e);
-        if (rc==0 || (errno==EINPROGRESS && ::poll(&pfd,1,1000)>0 && getsockopt(fd_,SOL_SOCKET,SO_ERROR,&e,&n)==0 && e==0)) break;
-        // 该候选地址连不上：关掉后尝试下一个
-        ::close(fd_); fd_=-1;
-      }
-      freeaddrinfo(res);
-      // 关闭 Nagle：MAVLink 全是小包，攒包会额外引入数十毫秒时延
-      if(fd_>=0) { int yes=1; setsockopt(fd_,IPPROTO_TCP,TCP_NODELAY,&yes,sizeof(yes)); }
-    } else fd_ = ::open(dev.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    // 串口与 TCP 桥接共用错误出口：失败时 err 带上 strerror 便于现场排查
+    fd_ = ::open(dev.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    // 失败时 err 带上 strerror 便于现场排查
     if (fd_ < 0)
     {
       err = std::string("open(") + dev + ") 失败: " + std::strerror(errno);
       return false;
     }
 
-    if (!tcp) {
     // 串口配置：下列任一 tcgetattr/cfsetispeed/cfsetospeed/tcsetattr 失败都要 close() 回滚后报错
     termios tio;
     std::memset(&tio, 0, sizeof(tio));
@@ -96,7 +68,6 @@ namespace ego_onboard
     }
     // 丢弃打开瞬间残留的半帧，避免 MAVLink 解析器从错位字节开始同步
     tcflush(fd_, TCIOFLUSH);
-    }
 
     // 启动读线程：它是唯一读该描述符的地方，写入统一走 write()；
     // 置 run_ 必须早于建线程，否则读线程可能刚起来就看到 false 而立即退出

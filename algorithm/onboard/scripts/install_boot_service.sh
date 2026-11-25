@@ -43,7 +43,7 @@ for name in ('uav-onboard','uav-lidar-ptp'):
     text=(root/'algorithm/onboard/deploy'/f'{name}.service.in').read_text()
     text=text.replace('@PROJECT_DIR@',project).replace('@RUN_USER@',user)
     (out/(name+'.service')).write_text(text)
-(out/'uav-onboard.env').write_text(f'UAV_MODE=control\nUAV_SERIAL={serial}\nUAV_BAUD=921600\nUAV_KML={project}/missions/mission.kml\nUAV_LIDAR_IFACE={interface}\n')
+(out/'uav-onboard.env').write_text(f'UAV_SERIAL={serial}\nUAV_BAUD=921600\nUAV_KML={project}/missions/mission.kml\nUAV_LIDAR_IFACE={interface}\n')
 PY
 run_group=$(id -gn "$run_user")
 # 构建目录与任务目录归属运行用户，避免 root 产物影响后续服务。

@@ -13,7 +13,7 @@ User=@RUN_USER@
 SupplementaryGroups=dialout
 WorkingDirectory=@PROJECT_DIR@
 EnvironmentFile=/etc/uav-onboard.env
-# start_onboard.sh 创建本次日志目录、选择 control/observe 模式并启动主程序。
+# start_onboard.sh 创建本次日志目录并启动主程序（实机飞行控制）。
 ExecStart=/bin/bash "@PROJECT_DIR@/algorithm/onboard/scripts/start_onboard.sh"
 # 单次任务不自动重启；重启需重新交付任务，避免意外重复起飞。
 Restart=no

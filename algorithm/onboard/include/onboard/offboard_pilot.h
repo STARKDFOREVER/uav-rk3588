@@ -26,11 +26,8 @@ namespace ego_onboard
   struct PlannerIO
   {
     virtual ~PlannerIO() {}
-    // 参考航线（局部 ENU，原点 = home）
-    virtual void setReferenceRoute(const std::vector<Eigen::Vector3d> &) {}
-    // 当前航段终点（局部 ENU）
-    virtual void setLegGoal(const Eigen::Vector3d &) {}
-    virtual void setLeg(const Eigen::Vector3d &, const Eigen::Vector3d &end, bool) { setLegGoal(end); }
+    // 当前航段：起点/终点（局部 ENU）+ 是否为最后一段
+    virtual void setLeg(const Eigen::Vector3d &, const Eigen::Vector3d &, bool) {}
     // 新位姿（来自飞控）
     virtual void onPose(const ego_sensor::TimedPose &pose) = 0;
     // 原始雷达坐标系点云；采样时间已映射到共同轴，由适配层逐点去畸变。
@@ -116,8 +113,6 @@ namespace ego_onboard
       double handover_stable_s = 1.5;             // 高度/位置和悬停速度连续满足的时间
       double handover_max_speed_mps = 0.3;        // 认为已悬停的最大三维速度
       double wp_reach_tol = 1.5;     // 航点到达判定
-      // 规划
-      bool use_planner = true;       // false = 只跑时序（离线验证用）
 
       // 提频
       uint16_t rate_global_position_hz = 50; // 33
@@ -137,7 +132,6 @@ namespace ego_onboard
 
       // 输出形态：位置 + yaw 必发；速度前馈可选。
       bool velocity_feedforward = false; // 是否在 setpoint 里带速度前馈
-      bool observe_only = false;         // true = 只观察/记录，不切模式、不发 setpoint
       double pose_timeout_s = 0.25;      // 位姿超过多久算不新鲜
       double position_extrapolation_s = 0.25; // 单帧位置+速度外推的有效时长；新位置立即换锚点
       double setpoint_hz = 20.0;         // setpoint 发送频率
@@ -146,13 +140,10 @@ namespace ego_onboard
 
     void setPlanner(PlannerIO *p) { planner_ = p; }
     void setConfig(const Config &c) { cfg_ = c; PoseAssemblerConfig pc; pc.max_position_extrapolation_s=c.position_extrapolation_s; pose_asm_.setConfig(pc); }
-    const Config &config() const { return cfg_; }
 
     // 航线以「第 1 个航点 = 起飞点」约定传入（与 KML 一致）
     // 进入 LINK 阶段；t_start_ = -1 表示还没开始正式巡航计时
     void start(const std::vector<GeoWaypoint> &route);
-    // 观察模式：只收报文、跟踪状态，不切 Offboard、不发 setpoint
-    void startObserving() { cfg_.observe_only = true; phase_ = Phase::LINK; t_start_ = -1; }
     // 由主循环每拍注入统一时钟（tick 与报文处理都用这个时刻）
     void setReceiveTime(double now) { t_now_ = now; }
     // 外部依赖（雷达/地图/任务）是否就绪；false 时不会进入接管
@@ -170,9 +161,6 @@ namespace ego_onboard
     bool clockReady(double now) const { return alignment_.valid(now); }
     // 外部要求停止：直接进入 FAILED 并记录原因
     void stop(const std::string &why) { fail(why); }
-    // 由 TIMESYNC 估计出的飞控 UTC 时间（未对时前为 0）
-    double fcuUnixTime() const { return fcu_unix_; }
-
 
     // 飞控下行字节（TCP/UDP 收上来的原始流）
     // 只做解析和状态更新，需要回应答的帧先攒在 outbox_，tick 时统一 flush
@@ -182,31 +170,20 @@ namespace ego_onboard
     void tick(double now, std::vector<std::vector<uint8_t>> &out);
 
     Phase phase() const { return phase_; }
-    bool armed() const { return armed_; }
-    uint8_t mainMode() const { return main_mode_; }
-    uint8_t subMode() const { return sub_mode_; }
     HandoverDiagnostics handoverDiagnostics(double now) const;
     const GeoOrigin &origin() const { return origin_; }
-    int currentLeg() const { return leg_; }
-    int routeSize() const { return (int)route_.size(); }
     const char *lastError() const { return err_.c_str(); }
     // 最近一次用于控制的实时位姿（局部 ENU，已按姿态流外推）。
     // 感知层用它确定传感器所在位置（合成点云 / 建图观测点都以此为准）。
     const ego_sensor::TimedPose &latestPose() const { return latest_pose_; }
-    bool hasPosition() const { return have_pos_; }
     // GPS 健康状态（诊断用）
     uint8_t gpsFixType() const { return gps_fix_type_; }
     // 定位可信：GPS_RAW_INT 仍在来且 fix 足够好（丢星后 fix 会保持最后值，不能只看 fix）。
     bool gpsOk(double now) const { return evaluateHealth(now).gps_ok; }
     // 飞行任务异常 / 安全悬停（诊断用）
-    bool holding() const { return phase_ == Phase::HOLD; }
     HoldReason holdReason() const { return hold_reason_; }
-    int holdCount() const { return hold_count_; }           // 累计进悬停次数
-    int gpsDropCount() const { return gps_drop_count_; }    // 其中定位引起的
-    int sensingDropCount() const { return sensing_drop_count_; } // 其中感知引起的
     uint64_t plannerSetpoints() const { return planner_setpoints_; }
     uint64_t cruiseHoldSetpoints() const { return cruise_hold_setpoints_; }
-    const Eigen::Vector3d &holdPosition() const { return hold_pos_; }
     // 丢星后的推算经纬高（只用于上报/判点，不参与控制）；age_s = 距最后一次有效定位
     bool gpsEstimate(GeoFix &fix, double &age_s) const { return reckoner_.estimate(t_now_, fix, age_s); }
     // 静态诊断：各报文解析/CRC 统计
@@ -227,14 +204,18 @@ namespace ego_onboard
       bool altitude_ok = false; // 在接管高度窗内
     };
     Health evaluateHealth(double now) const;
+    // 复用已算好的健康快照，供同一拍内多处诊断使用。
+    HandoverDiagnostics handoverDiagnostics(double now, const Health &h) const;
+    // GPS_RAW_INT 仍在来且 fix 足够好（航位推算与 GPS 判据共用）。
+    bool gpsFixFresh(double now) const;
 
     // 输出：位置 + 保持航向的悬停点；false = 目标非有限值，调用方转 FAILED。
     bool emitHoldSetpoint(double now, const Eigen::Vector3d &pos,
                           std::vector<std::vector<uint8_t>> &out);
     bool emitSetpoint(double now, const ego_planner::QuadrotorCommand &cmd,
                       std::vector<std::vector<uint8_t>> &out);
-    // 提频只发一次；with_extension 控制是否附带 245 EXTENDED_SYS_STATE。
-    void requestRatesOnce(std::vector<std::vector<uint8_t>> &out, bool with_extension);
+    // 提频只发一次（含 245 EXTENDED_SYS_STATE）。
+    void requestRatesOnce(std::vector<std::vector<uint8_t>> &out);
 
     // 各报文处理
     void onHeartbeat(const Heartbeat &hb, double now);
@@ -270,7 +251,7 @@ namespace ego_onboard
     TimeAlignment alignment_;
     double t_last_home_request_ = -1e9;  // 上次请求 HOME_POSITION 的时刻
     double t_last_sync_request_ = -1e9, t_last_pos_ = -1e9, t_last_att_ = -1e9; // 上次 TIMESYNC / 位置 / 姿态
-    double last_pos_boot_ = -1, last_att_boot_ = -1, fcu_unix_ = 0;
+    double last_pos_boot_ = -1, last_att_boot_ = -1;
     bool input_ready_ = true;
 
     PoseAssembler pose_asm_;
@@ -291,7 +272,6 @@ namespace ego_onboard
     double t_last_setpoint_ = -1e9;
     uint64_t planner_setpoints_ = 0, cruise_hold_setpoints_ = 0;
     double t_cmd_sent_ = -1e9;
-    uint16_t last_cmd_ = 0;
     bool mode_switch_sent_ = false; // 是否已发过切 Offboard 的 COMMAND_LONG
     bool waiting_offboard_ = false; // 已请求切换，正在等飞控确认
     bool mode_ack_seen_ = false;
@@ -303,22 +283,17 @@ namespace ego_onboard
     bool armed_ = false;
     uint8_t main_mode_ = 0, sub_mode_ = 0;
     Eigen::Vector3d pos_enu_ = Eigen::Vector3d::Zero();  // 位置流原值（2Hz，滞后）
-    Eigen::Vector3d pos_ctrl_ = Eigen::Vector3d::Zero(); // 外推后（10Hz），供规划/判点用
-    ego_sensor::TimedPose latest_pose_;                  // 同 pos_ctrl_，但带姿态
+    ego_sensor::TimedPose latest_pose_;                  // 外推后（10Hz）带姿态，供规划/判点用
     bool have_pos_ = false;
 
     // GPS 健康监测
     uint8_t gps_fix_type_ = 0;
-    uint8_t gps_sats_ = 0;
     double t_last_gps_ = -1e9;     // 最近一次收到 GPS_RAW_INT
     double t_gps_bad_ = -1e9;      // 开始连续无效的时刻
 
     // 安全悬停
     Eigen::Vector3d hold_pos_ = Eigen::Vector3d::Zero(); // 悬停点
     HoldReason hold_reason_ = HoldReason::NONE;
-    int hold_count_ = 0;
-    int gps_drop_count_ = 0;
-    int sensing_drop_count_ = 0;
     double t_hold_clear_ = -1e9; // 所有异常都清除的起始时刻
     bool sensing_healthy_ = true; // 最近一次查询到的感知健康状态
     GpsDeadReckoner reckoner_;   // 丢星后的短时航位推算（只用于上报）

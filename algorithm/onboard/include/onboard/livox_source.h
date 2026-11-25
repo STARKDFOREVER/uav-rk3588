@@ -9,8 +9,6 @@
 #include <sensor/frame_assembler.h>
 namespace ego_onboard {
 // Livox Mid-360S 数据源：封装 SDK2 回调，把原始 UDP 点云包交给 FrameAssembler
-// 拼成整帧，再放进有界队列供主循环取用。
-// 线程模型：SDK2 回调线程只做入队/统计，pop() 由主循环调用；内部用 mutex_ 保护。
 class LivoxSource {
  public:
   // 解析/过滤参数，来自 YAML 的 lidar 段

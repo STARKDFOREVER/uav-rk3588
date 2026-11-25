@@ -45,10 +45,9 @@ namespace ego_onboard
   // 启动
   void OffboardPilot::start(const std::vector<GeoWaypoint> &route)
   {
-    // 入口校验：航点数上下限对应飞控航点协议容量，高度必须有限且为正；
-    // 任何一项不满足直接 FAILED，不进入 LINK。
+    // 入口校验：航点数至少 2，高度必须有限且为正；任何一项不满足直接 FAILED，不进入 LINK。
     route_ = route;
-    if (route_.size() < 2 || route_.size() > 65533 ||
+    if (route_.size() < 2 ||
         !std::isfinite(cfg_.cruise_alt_m) || cfg_.cruise_alt_m <= 0.5 ||
         !std::isfinite(cfg_.handover_alt_tolerance_m) || cfg_.handover_alt_tolerance_m <= 0)
     {
@@ -65,7 +64,7 @@ namespace ego_onboard
       }
     bool added = false;
     std::string why;
-    if (!ensureReturnToStart(route_, 65533, added, why))
+    if (!ensureReturnToStart(route_, added, why))
     {
       fail(why);
       return;
@@ -85,7 +84,6 @@ namespace ego_onboard
 
     // GPS 健康状态
     gps_fix_type_ = 0;
-    gps_sats_ = 0;
     t_last_gps_ = -1e9;
     t_gps_bad_ = -1e9;
     // setpoint 的 type_mask：位置 + yaw 必发；速度前馈按配置
@@ -102,9 +100,6 @@ namespace ego_onboard
     // 安全悬停状态
     hold_pos_.setZero();
     hold_reason_ = HoldReason::NONE;
-    hold_count_ = 0;
-    gps_drop_count_ = 0;
-    sensing_drop_count_ = 0;
     t_hold_clear_ = -1e9;
     sensing_healthy_ = true;
     reckoner_.reset();
@@ -135,12 +130,6 @@ namespace ego_onboard
             send(m, outbox_);
           }
         }
-        break;
-      }
-      case SystemTime::ID: {
-        // 仅用于诊断/上报的 UTC 参考，不参与控制时钟。
-        SystemTime m;
-        if (SystemTime::decode(msg.payload.data(), msg.payload.size(), m)) fcu_unix_ = m.time_unix_usec * 1e-6;
         break;
       }
       case Heartbeat::ID:
@@ -231,7 +220,7 @@ namespace ego_onboard
     have_pos_ = true;
 
     // 航位推算：定位有效就用它重置锚点；无效则对速度做一次积分（输出经纬高给上报用）
-    if (gps_fix_type_ >= cfg_.gps_min_fix && t_now_-t_last_gps_<=cfg_.gps_rx_timeout_s)
+    if (gpsFixFresh(t_now_))
     {
       GeoFix f;
       f.lat_deg = g.lat * 1e-7;
@@ -250,7 +239,6 @@ namespace ego_onboard
     // 这里只记录原始状态，不做判定：定位是否可信统一在 evaluateHealth 里按
     // 「报文仍在来 + fix_type 够好」两个条件计算，避免多处口径不一致。
     gps_fix_type_ = g.fix_type;
-    gps_sats_ = g.satellites_visible;
     t_last_gps_ = t_now_;
   }
 
@@ -271,7 +259,7 @@ namespace ego_onboard
     tp.position_anchor.t += tp.t - boot;
     if (t_now_-tp.t>cfg_.pose_timeout_s || tp.t>t_now_+0.005) return;
     hold_yaw_ = std::atan2(tp.q.toRotationMatrix()(1,0),tp.q.toRotationMatrix()(0,0));
-    pos_ctrl_=tp.p; latest_pose_=tp;
+    latest_pose_=tp;
     if(planner_)planner_->onPose(tp);
   }
 
@@ -292,6 +280,12 @@ namespace ego_onboard
     t_last_hb_ = now;
   }
 
+  bool OffboardPilot::gpsFixFresh(double now) const
+  {
+    return t_last_gps_ > -1e8 && now - t_last_gps_ <= cfg_.gps_rx_timeout_s &&
+        gps_fix_type_ >= cfg_.gps_min_fix;
+  }
+
   // ----------------------------------------------------------- 单拍健康快照
   OffboardPilot::Health OffboardPilot::evaluateHealth(double now) const
   {
@@ -300,7 +294,7 @@ namespace ego_onboard
     h.pose_ok = poseFresh(now);
     h.timing_ok = clockReady(now) && input_ready_;
     h.gps_rx = t_last_gps_ > -1e8 && now - t_last_gps_ <= cfg_.gps_rx_timeout_s;
-    h.gps_ok = !cfg_.gps_failsafe || (h.gps_rx && gps_fix_type_ >= cfg_.gps_min_fix);
+    h.gps_ok = !cfg_.gps_failsafe || gpsFixFresh(now);
     h.sensing_ok = sensing_healthy_;
     h.all_clear = h.gps_ok && h.sensing_ok && h.timing_ok && h.pose_ok;
     if (!route_enu_.empty())
@@ -309,11 +303,10 @@ namespace ego_onboard
     return h;
   }
 
-  // ---------------------------------------------------------------- 输出
+  // 输出
   bool OffboardPilot::emitSetpoint(double now, const ego_planner::QuadrotorCommand &cmd,
                                    std::vector<std::vector<uint8_t>> &out)
   {
-    // 目标含非有限值直接拒绝，由调用方转 FAILED —— 发 NaN setpoint 等于让飞控失控。
     if (!cmd.position.allFinite() || !cmd.velocity.allFinite() || !cmd.acceleration.allFinite() ||
         !std::isfinite(cmd.yaw) || !std::isfinite(cmd.yaw_dot))
       return false;
@@ -338,22 +331,24 @@ namespace ego_onboard
     return emitSetpoint(now, cmd, out);
   }
 
-  void OffboardPilot::requestRatesOnce(std::vector<std::vector<uint8_t>> &out, bool with_extension)
+  void OffboardPilot::requestRatesOnce(std::vector<std::vector<uint8_t>> &out)
   {
-    // 提频只发一次（req_stream_id 填消息 ID）；with_extension 时附带 245 EXTENDED_SYS_STATE，
-    // 早期飞控固件不支持会忽略，不影响其余两路。
+    // 提频只发一次（req_stream_id 填消息 ID），并附带 245 EXTENDED_SYS_STATE；
     if (!cfg_.request_rates || rates_requested_)
       return;
     rates_requested_ = true;
     send(RequestDataStream::forMessage(GlobalPositionInt::ID, cfg_.rate_global_position_hz, cfg_.target_system), out);
     send(RequestDataStream::forMessage(Attitude::ID, cfg_.rate_attitude_hz, cfg_.target_system), out);
-    if (with_extension)
-      send(RequestDataStream::forMessage(245, cfg_.rate_extension_hz, cfg_.target_system), out);
+    send(RequestDataStream::forMessage(245, cfg_.rate_extension_hz, cfg_.target_system), out);
   }
 
   HandoverDiagnostics OffboardPilot::handoverDiagnostics(double now) const
   {
-    const Health h = evaluateHealth(now);
+    return handoverDiagnostics(now, evaluateHealth(now));
+  }
+
+  HandoverDiagnostics OffboardPilot::handoverDiagnostics(double now, const Health &h) const
+  {
     HandoverDiagnostics d;
     d.fc_alive = h.fc_alive;
     d.armed = armed_;
@@ -383,12 +378,12 @@ namespace ego_onboard
       d.horizontal_error_m =
           (pos_enu_.head<2>() - route_enu_.front().head<2>()).norm();
       d.horizontal_position_ok = d.horizontal_error_m <= cfg_.handover_position_tolerance_m;
-      d.altitude_ok = h.altitude_ok;
     }
+    d.altitude_ok = h.altitude_ok; // 无航线时 evaluateHealth 已给 false
     d.speed_ok = d.speed_mps <= cfg_.handover_max_speed_mps;
-    d.ready = d.fc_alive && d.armed && d.pose_ok && d.timing_ok && d.sensing_ok &&
-        d.gps_ok && d.main_mode == MODE_POS_HOLD && d.horizontal_position_ok &&
-        d.altitude_ok && d.speed_ok;
+    // 复用 evaluateHealth 的汇总判定，避免两套口径；接管额外要求已解锁 + 定点模式。
+    d.ready = h.all_clear && d.fc_alive && d.armed && d.main_mode == MODE_POS_HOLD &&
+        d.horizontal_position_ok && d.altitude_ok && d.speed_ok;
     return d;
   }
 
@@ -404,8 +399,6 @@ namespace ego_onboard
       out.push_back(std::move(f));
     outbox_.clear();
 
-    // 链路维持：心跳 1Hz；TIMESYNC 5Hz（飞控按样本收敛）；未拿到 HOME 时每 2s 请求一次
-    // （MAV_CMD_GET_HOME_POSITION=512，param1=242 表示目标为当前系统）。
     // 心跳
     if (now - t_last_hb_ >= 1.0 / cfg_.heartbeat_hz)
       sendHeartbeat(out, now);
@@ -419,30 +412,20 @@ namespace ego_onboard
       request.target_component=cfg_.target_component; request.param1=242;
       send(request,out); t_last_home_request_=now;
     }
-    // 观察模式到此为止：只发心跳、提频、校时，不切模式、不发 setpoint、不动飞机。
-    if (cfg_.observe_only) {
-      const bool fc_alive = t_last_fc_hb_ > -1e8 && now - t_last_fc_hb_ < cfg_.link_timeout;
-      if (fc_alive) requestRatesOnce(out, false);
-      return; // NO mission upload, mode change, arming, or setpoint in observe mode.
-    }
     // 只有真正在控制飞机时才要求时钟连续；LINK/等待阶段断一下可以重新收敛。
     const bool active = phase_ == Phase::OFFBOARD_CRUISE || phase_ == Phase::HOLD;
     if (active && !clockReady(now)) { fail("FCU clock synchronization lost"); return; }
 
-    // ---- 单拍健康快照 ----
-    // 连续丢帧 = 点云没进图，地图里全是"未知"，EGO 会规划出一条直线。
-    // 这种失效在界面上看不出来，所以必须主动停下来。
+    // 单拍健康快照
     sensing_healthy_ = !cfg_.sensing_failsafe || !planner_ || planner_->sensingHealthy();
     const Health health = evaluateHealth(now);
     if (active && !health.pose_ok) { fail("position/attitude stream stale"); return; }
 
     // GPS 判据只有两个：GPS_RAW_INT 还在来（2Hz）、且 fix_type 够好。
-    // 位置本身不在这里重算 —— 飞控 EKF 已经在融合 IMU，丢星后它会继续输出推算位置，
-    // 我们只是消费 GLOBAL_POSITION_INT，并在定位不可信时停下来等。
     if (health.gps_ok) t_gps_bad_ = -1e9;
     else if (t_gps_bad_ < -1e8) t_gps_bad_ = now; // 连续无效的起始时刻
 
-    // ---- 统一恢复判据：所有异常都清除了，并且稳定一段时间 ----
+    // 统一恢复判据：所有异常都清除了，并且稳定一段时间
     if (health.all_clear)
     {
       if (t_hold_clear_ < -1e8)
@@ -459,12 +442,10 @@ namespace ego_onboard
     if (active && now - t_last_setpoint_ < 1.0 / cfg_.setpoint_hz) return;
     switch (phase_)
     {
-    // ---------------------------------------------------------- S0 链路
+    // S0 链路
     case Phase::LINK:
     {
-      // 一看到飞控就先提频：默认 2Hz 位置 / 10Hz 姿态不够用（协议 2.5.1）
-      if (health.fc_alive) requestRatesOnce(out, true);
-      // 三个前提缺一不可：飞控心跳、HOME 原点、至少一帧有效位置；30s 内凑不齐就 FAILED。
+      if (health.fc_alive) requestRatesOnce(out);
       if (!health.fc_alive || !origin_.valid || !have_pos_)
       {
         if (now - t_start_ > 30.0)
@@ -480,7 +461,6 @@ namespace ego_onboard
       }
       if (planner_)
       {
-        planner_->setReferenceRoute(route_enu_);
         if (route_enu_.size() >= 2)
           planner_->setLeg(route_enu_[0], route_enu_[1], route_enu_.size() == 2);
       }
@@ -490,12 +470,11 @@ namespace ego_onboard
       break;
     }
 
-    // GCS starts flight; onboard only observes and waits for stable POS_HOLD.
     case Phase::WAIT_GROUND_START:
     {
       // 解锁/起飞由地面站完成；这里只等飞机稳定悬停在接管窗内，连续 handover_stable_s 才接管，
       // 中途任一项不满足就清零重新计时。
-      const auto handover = handoverDiagnostics(now);
+      const auto handover = handoverDiagnostics(now, health);
       if (handover.ready)
       {
         if (t_handover_candidate_ < -1e8) t_handover_candidate_ = now;
@@ -511,7 +490,7 @@ namespace ego_onboard
       break;
     }
 
-    // ------------------------------- S4 先连发 setpoint，再切 Offboard
+    // S4 先连发 setpoint，再切 Offboard
     case Phase::PRE_OFFBOARD:
     {
       // 预发 setpoint 期间若飞机离开高度窗、出现异常或掉出定点/Offboard，退回等待阶段重新计时。
@@ -534,7 +513,6 @@ namespace ego_onboard
       {
         send(CommandLong::setMode(MODE_OFFBOARD, 0, cfg_.target_system), out);
         t_cmd_sent_ = now;
-        last_cmd_ = CMD_DO_SET_MODE;
         mode_switch_sent_ = true;
         waiting_offboard_ = true;
         mode_ack_seen_ = false;
@@ -553,7 +531,7 @@ namespace ego_onboard
       break;
     }
 
-    // --------------------------- S5 航点间 Offboard（我们的系统接管）
+    // S5 航点间 Offboard（我们的系统接管）
     case Phase::OFFBOARD_CRUISE:
     {
       // 飞控失联：此时没法悬停，只能报错（不能一直往断掉的链路写 setpoint）
@@ -577,13 +555,8 @@ namespace ego_onboard
 
       if (why != HoldReason::NONE)
       {
-        hold_pos_ = pos_ctrl_; // 以当前位姿为悬停点
+        hold_pos_ = latest_pose_.p; // 以当前位姿为悬停点
         hold_reason_ = why;
-        ++hold_count_;
-        if (why == HoldReason::GPS_LOST)
-          ++gps_drop_count_;
-        else
-          ++sensing_drop_count_;
         t_hold_clear_ = -1e9; // 恢复计时从进入悬停重新开始，不能沿用之前的
         phase_ = Phase::HOLD;
         t_phase_ = now;
@@ -592,8 +565,8 @@ namespace ego_onboard
 
       ego_planner::QuadrotorCommand cmd;
       bool ok = false;
-      if (cfg_.use_planner && planner_)
-        ok = planner_->step(now, pos_ctrl_, cmd);
+      if (planner_)
+        ok = planner_->step(now, latest_pose_.p, cmd);
       if (!ok)
       {
         // 规划失败 → 原地悬停（实机这里应叠加飞控侧急停/悬停）
@@ -610,7 +583,7 @@ namespace ego_onboard
       // 航点到达由本地位置判定；推进本地航段并更新规划目标。
       if (leg_ + 1 < (int)route_enu_.size() && have_pos_)
       {
-        if ((pos_ctrl_ - route_enu_[leg_ + 1]).norm() < cfg_.wp_reach_tol)
+        if ((latest_pose_.p - route_enu_[leg_ + 1]).norm() < cfg_.wp_reach_tol)
         {
           leg_++;
           if (leg_ + 1 < (int)route_enu_.size())
@@ -621,9 +594,8 @@ namespace ego_onboard
           else
           {
             // 最后航点已返回 KML 起点：保持巡航高度，等地面站降落。
-            hold_pos_ = pos_ctrl_;
+            hold_pos_ = latest_pose_.p;
             hold_reason_ = HoldReason::MISSION_DONE;
-            ++hold_count_;
             t_hold_clear_ = -1e9;
             phase_ = Phase::HOLD;
             t_phase_ = now;
@@ -633,7 +605,7 @@ namespace ego_onboard
       break;
     }
 
-    // ----------------- S5b 安全悬停（任何飞行任务异常，仍在 Offboard 内）
+    // S5b 安全悬停（任何飞行任务异常，仍在 Offboard 内）
     case Phase::HOLD:
     {
       // 这三类异常没法靠悬停解决，只能报错
@@ -654,7 +626,7 @@ namespace ego_onboard
       }
 
       // 原地悬停：冻结进入悬停那一刻的位置和航向。
-      if (!emitHoldSetpoint(now, hold_pos_, out)) { fail("nonfinite control target"); break; 
+      if (!emitHoldSetpoint(now, hold_pos_, out)) { fail("nonfinite control target"); break; }
       // 异常全部清除并稳定 -> 丢掉过期轨迹，回到巡航
       if (hold_reason_ != HoldReason::MISSION_DONE && health.all_clear &&
           now - t_hold_clear_ >= cfg_.hold_recover_confirm_s)

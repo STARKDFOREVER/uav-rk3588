@@ -132,6 +132,10 @@ namespace ego_onboard
     void clearState();
     // 作废当前轨迹及相关的定时/状态位（调用方必须已持有 mtx_）
     void invalidateTrajectory();
+    // 清空位姿缓冲（严格覆盖开关随 cfg_ 恢复）
+    void resetPoseBuffer();
+    // 作废轨迹并清掉待发命令
+    void resetControl();
 
     // 把当前位置投影到航段 A→B 上，返回横向距离并输出弧长 s_out
     double projectRoute(const Eigen::Vector3d &p, double &s_out) const;

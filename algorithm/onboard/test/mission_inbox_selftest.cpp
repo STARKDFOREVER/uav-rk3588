@@ -1,15 +1,5 @@
-// ---------------------------------------------------------------------------
 // mission_inbox_selftest.cpp —— KML 任务收件箱（MissionInput）自测，CTest 单元级
 // 测试目的：在真实文件系统上驱动 MissionInput 状态机，验证“先到先装、装后锁存”：
-//   缺失 KML 时持续等待、出现后立即读取、非法内容直接 FAILED、合法任务自动闭合、
-//   READY 后替换内容无法改写已激活航线、restart 清空旧任务，以及严格模式快速失败。
-// 覆盖约束：READY 锁存；失败为终态；非法任务上限（max_waypoints=0）必须显式拒绝；
-//   wait_for_file=false 时缺文件立即 FAILED。
-// 运行参数：无（进程内构造配置）；临时目录由 mkdtemp 创建，测试结束删除。
-// 通过判据：每条 check 打印 [PASS]/[FAIL]，存在失败时退出码 1；mkdtemp 失败退出 2。
-// 说明：step() 的时间参数是合成的单调秒，用于在毫秒内模拟等待/解析时序，
-//   不需要真实等待；文件内容通过覆盖写入模拟直传投递。
-// ---------------------------------------------------------------------------
 #include <onboard/mission_input.h>
 #include <cstdio>
 #include <fstream>
@@ -61,9 +51,9 @@ int main() {
   // 删除文件后 restart：start 必须清空上一次准备的任务，而不是复用旧状态。
   std::remove(path.c_str());input.start(cfg);input.step(3000);
   check(input.state()==MissionInputState::WAIT_KML&&input.mission().route.empty(),"restart clears any previous prepared task");
-  // 关闭等待：prepare-only 严格模式下缺文件应立即 FAILED，便于上层快速探错。
+  // 关闭等待：wait_for_file=false 时缺文件应立即 FAILED，便于上层快速探错。
   cfg.wait_for_file=false;input.start(cfg);input.step();
-  check(input.state()==MissionInputState::FAILED,"strict prepare-only mode still fails immediately on a missing file");
+  check(input.state()==MissionInputState::FAILED,"strict mode with wait_for_file=false still fails immediately on a missing file");
   // 非法任务上限（0 个航点）必须显式拒绝，不能被静默接受成空任务。
   cfg.wait_for_file=true;cfg.max_waypoints=0;input.start(cfg);
   check(input.state()==MissionInputState::FAILED,"invalid mission limits are not silently accepted");

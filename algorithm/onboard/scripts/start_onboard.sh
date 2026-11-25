@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One process per boot/task. The executable owns WAIT_KML and task validation.
-# 用途：systemd 调用入口，创建本次日志目录并以 control/observe 模式启动 onboard_main。
+# 用途：systemd 调用入口，创建本次日志目录并启动实机飞行控制。
 # 前置条件：.build/onboard/onboard_main 已构建；串口/波特率/配置/KML 可由环境变量覆盖。
 set -euo pipefail
 project=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
@@ -8,13 +8,6 @@ cd "$project"
 binary="$project/.build/onboard/onboard_main"
 # 未构建时返回 2，避免服务静默失败。
 [[ -x "$binary" ]] || { echo 'Build .build/onboard/onboard_main before deployment.' >&2; exit 2; }
-mode=${UAV_MODE:-control}
-# UAV_MODE 仅接受 control（带控制输出）或 observe（只观察），其他值返回 2。
-case "$mode" in
-  control) mode_args=(--enable-control) ;;
-  observe) mode_args=(--observe-only) ;;
-  *) echo 'UAV_MODE must be control or observe.' >&2; exit 2 ;;
-esac
 # 每次运行使用独立时间戳目录，标准输出同时写入 onboard.log 便于事后排查。
 record_root="$project/log"
 mkdir -p "$record_root"
@@ -31,4 +24,4 @@ exec stdbuf -oL -eL "$binary" \
   --kml "${UAV_KML:-$project/missions/mission.kml}" \
   --livox-config "$project/algorithm/onboard/deploy/mid360s.json" \
   --lidar-ip 192.168.1.173 \
-  --error-dir "$record_dir" "${mode_args[@]}" "${record_args[@]}"
+  --error-dir "$record_dir" --enable-control "${record_args[@]}"
