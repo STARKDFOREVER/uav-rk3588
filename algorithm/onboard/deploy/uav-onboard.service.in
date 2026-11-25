@@ -1,0 +1,28 @@
+[Unit]
+# 机载任务主服务：等待 KML 任务文件就绪后启动一次任务进程。
+Description=UAV onboard task (wait for KML, then start)
+After=local-fs.target network.target
+RequiresMountsFor=@PROJECT_DIR@
+# 弱依赖 PTP：雷达时间同步未就绪不阻塞任务启动。
+Wants=uav-lidar-ptp.service
+
+[Service]
+Type=simple
+# 以部署用户运行；加入 dialout 组以获得飞控串口访问权限。
+User=@RUN_USER@
+SupplementaryGroups=dialout
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=/etc/uav-onboard.env
+# start_onboard.sh 创建本次日志目录、选择 control/observe 模式并启动主程序。
+ExecStart=/bin/bash "@PROJECT_DIR@/algorithm/onboard/scripts/start_onboard.sh"
+# 单次任务不自动重启；重启需重新交付任务，避免意外重复起飞。
+Restart=no
+# 收到 TERM 后最多等 10 s 退出，超时由 systemd 强杀。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uav-onboard
+
+[Install]
+WantedBy=multi-user.target

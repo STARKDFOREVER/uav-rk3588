@@ -1,0 +1,347 @@
+// EgoPlannerAdapter 自检
+// 用"合成激光帧 + 合成位姿"喂适配器，看它是不是真的：
+//   1) 把点云建成占据栅格（insert-only）；
+//   2) 生成并跟踪一条避障轨迹；
+//   3) 命令始终落在自由空间（不撞）；
+//   4) 绕开障碍后回到参考航线并到达本段终点；
+//   5) 位姿覆盖不足时整帧丢弃（绝不拿错位姿污染 insert-only 地图）。
+//
+// 运行方式：ego_adapter_selftest <onboard.yaml>
+//   argv[1] 为生产配置，既用于校验真实安全间距参数，也用于最后的高速长航段场景。
+// 退出码：0 全部断言通过；1 存在断言失败；2 参数个数不对。
+// 所有时间轴、位姿和点云均为合成数据，不开启任何设备。
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include <Eigen/Eigen>
+
+#include "onboard/ego_planner_adapter.h"
+#include "onboard/config_file.h"
+
+using namespace ego_onboard;
+
+static int g_fail = 0;
+static void check(bool ok, const std::string &what)
+{
+  std::printf("  [%s] %s\n", ok ? " OK " : "FAIL", what.c_str());
+  if (!ok)
+    g_fail++;
+}
+
+int main(int argc, char **argv)
+{
+  if (argc != 2) return 2;
+  EgoPlannerAdapterConfig cfg;
+  cfg.resolution = 0.2;
+  // 高度带基准不在这里配：它由第一次 step() 那一帧的实际高度决定
+  cfg.altitude_band_half = 10.0;
+  // 单测保留完整的上下对称带，专门验证适配层逻辑；
+  // 实机 YAML 与膨胀量联调，保留较小的实际下降空间。
+  cfg.max_descent_below_ref = 10.0;
+  cfg.map_margin_z = 2.0;
+  cfg.min_flight_height = 5.0;
+  cfg.map_size_xy = Eigen::Vector2d(60.0, 60.0);
+  cfg.obstacles_inflation = 1.0;
+  cfg.max_vel = 5.0;
+  cfg.planning_horizon = 6.0;
+  cfg.local_target_step = 1.0;
+  cfg.replan_period = 0.5;
+
+  EgoPlannerAdapter adapter;
+  adapter.init(cfg);
+
+  // 当前航段：沿 +x 直线，高度 30 m（A=(0,0,30)，B=(30,0,30)）
+  const Eigen::Vector3d start(0.0, 0.0, 30.0);
+  const Eigen::Vector3d goal(30.0, 0.0, 30.0);
+  adapter.setLeg(start, goal, true);
+
+  // 障碍：正压在航线上的一个方块（x 12~18, y -5~5, z 24~32）
+  // 用 1 m 间隔的规则网格布点而不是面片采样：0.2 m 栅格再经 1 m 膨胀后，
+  // 相邻点之间的空隙必须被填满，否则规划器能从缝里"钻"过去，测试就失去意义。
+  std::vector<Eigen::Vector3d> block;
+  for (double x = 12.0; x <= 18.001; x += 1.0)
+    for (double y = -5.0; y <= 5.001; y += 1.0)
+      for (double z = 24.0; z <= 32.001; z += 1.0)
+        block.push_back(Eigen::Vector3d(x, y, z));
+
+  const double dt = 0.01;        // 100 Hz 控制
+  const double scan_dt = 0.1;    // 10 Hz 雷达
+  // 14 s 足够飞完 30 m 航段、绕过 6 m 厚墙并回到终点；再长只是重复同样的轨迹。
+  const double T = 14.0;
+
+  Eigen::Vector3d p = start;
+  double next_scan = 0.0;
+  double max_dev_y = 0.0, max_dev_z = 0.0, max_off_route = 0.0;
+  bool ever_non_braking = false;
+  bool cmd_in_obstacle = false;
+  bool speed_bounded = true;
+  bool ever_occupied_seen = false;
+  int steps = 0;
+
+  for (double t = 0.0; t < T; t += dt)
+  {
+    // 1) 位姿（模拟飞控 100 Hz 上报；雷达与机体同原点同朝向）
+    ego_sensor::TimedPose pose;
+    pose.t = t;
+    pose.p = p;
+    pose.q = Eigen::Quaterniond::Identity();
+    adapter.onPose(pose);
+
+    // 2) 10 Hz 合成点云帧（观测点 = 机体位置，坐标系 = 机体，外参为单位阵）
+    if (t >= next_scan)
+    {
+      next_scan += scan_dt;
+      ego_sensor::LidarFrame frame;
+      frame.t_base = t;
+      frame.points.reserve(block.size());
+      for (const auto &w : block)
+      {
+        ego_sensor::LidarPoint lp;
+        lp.p = w - p; // R = I -> 传感器系点 = 世界点 - 位置
+        lp.t_rel = 0.0;
+        frame.points.push_back(lp);
+      }
+      adapter.onScanFrame(frame);
+    }
+
+    // 3) 规划一拍
+    ego_planner::QuadrotorCommand cmd;
+    const bool ok = adapter.step(t, p, cmd);
+    if (!ok)
+    {
+      check(false, "step() 应当总是返回 true（失败时输出悬停指令）");
+      break;
+    }
+    steps++;
+    speed_bounded = speed_bounded && cmd.velocity.norm() <= cfg.max_vel * 1.05 + 0.01;
+
+    if (!adapter.braking())
+      ever_non_braking = true;
+
+    // 4) 命令不得落在占据体内
+    if (adapter.gridMap()->getInflateOccupancy(cmd.position) == 1)
+      cmd_in_obstacle = true;
+
+    // 5) 一格近似的位置环（时间常数 ~0.2 s）
+    // 用一阶跟随代替真实机体动力学：本测试只验证"规划—避障—到达"这条链路，
+    // 不验证飞控响应，故不让加速度/姿态动力学引入额外变量。
+    p += (cmd.position - p) * std::min(1.0, 5.0 * dt);
+
+    // 统计：偏离参考航线的程度
+    const Eigen::Vector3d on_route(p.x(), 0.0, 30.0);
+    max_off_route = std::max(max_off_route, (p - on_route).norm());
+    max_dev_y = std::max(max_dev_y, std::fabs(p.y()));
+    max_dev_z = std::max(max_dev_z, std::fabs(p.z() - 30.0));
+
+    if (adapter.gridMap()->getInflateOccupancy(Eigen::Vector3d(15.0, 0.0, 30.0)) == 1)
+      ever_occupied_seen = true;
+  }
+
+  const auto &st = adapter.stats();
+  std::printf("  [info] steps=%d 帧 %ld(丢 %ld) 入图点 %ld 重规划 %d 失败 %d 滑窗 %d 末次规划 %.1f ms\n",
+              steps, st.frames_total, st.frames_dropped, st.cloud_points,
+              st.replan, st.plan_fail, st.recenter, st.last_plan_ms);
+  std::printf("  [info] 最终位置 (%.2f, %.2f, %.2f)  最大偏航 %.2f m  最大 Δz %.2f m\n",
+              p.x(), p.y(), p.z(), max_dev_y, max_dev_z);
+
+  // ---- 断言 ----
+  check(st.frames_total > 50, "收到了激光帧");
+  check(ever_occupied_seen, "点云已建成占据栅格（障碍处 occupancy == 1）");
+  check(st.frames_dropped == 0, "位姿覆盖充分，没有丢帧");
+  check(ever_non_braking, "规划成功并生成了轨迹（非悬停）");
+  // Infeasible candidates may be rejected and retried. The required behavior
+  // is safe, speed-bounded output and eventual arrival, checked independently.
+  check(st.plan_success > 0 && speed_bounded, "拒绝不可行候选后仍输出满足总速度约束的轨迹");
+  check(!cmd_in_obstacle, "所有位置指令都落在自由空间（不撞障碍）");
+  check(max_dev_y > 1.0 || max_dev_z > 1.0, "确实产生了避障机动（发生了侧绕 / 上跨）");
+  check((p - goal).norm() < 2.0, "绕开障碍后回到航线并到达本段终点");
+
+  // ---- 位姿覆盖不足时必须丢帧 ----
+  {
+    EgoPlannerAdapter a2;
+    a2.init(cfg);
+    a2.setLeg(start, goal, true);
+    ego_sensor::TimedPose pose;
+    pose.t = 0.0;
+    pose.p = start;
+    pose.q = Eigen::Quaterniond::Identity();
+    a2.onPose(pose);
+
+    // 先跑一拍把图建起来（图要等"开始导航那一帧"才建，之前 onScanFrame 会被忽略）
+    ego_planner::QuadrotorCommand c2;
+    a2.step(0.0, start, c2);
+    check(a2.mapReady(), "建图完成（第一次 step 之后）");
+
+    ego_sensor::LidarFrame frame;
+    frame.t_base = 100.0; // 位姿历史覆盖不到
+    frame.points.push_back(ego_sensor::LidarPoint());
+    a2.onScanFrame(frame);
+    check(a2.stats().frames_dropped == 1, "位姿覆盖不足的帧被整帧丢弃");
+
+    // 还没有航线/轨迹时也要给出安全的悬停指令
+    EgoPlannerAdapter a3;
+    a3.init(cfg);
+    ego_planner::QuadrotorCommand cmd;
+    check(a3.step(0.0, start, cmd) && cmd.velocity.norm() == 0.0, "无航线时输出悬停指令");
+  }
+
+  // ---- 高度带基准 = 开始导航那一帧的实际高度（不是写死的常数）----
+  {
+    EgoPlannerAdapter a4;
+    a4.init(cfg);
+    check(!a4.mapReady(), "init() 之后还没建图（要等开始导航那一帧）");
+
+    const Eigen::Vector3d s4(0.0, 0.0, 12.0); // 这一趟的低空基准：12 m
+    a4.setLeg(s4, Eigen::Vector3d(20.0, 0.0, 12.0), true);
+
+    ego_planner::QuadrotorCommand cmd;
+    a4.step(0.0, s4, cmd);
+    check(a4.mapReady(), "第一次 step() 才建图");
+    check(std::fabs(a4.altitudeRef() - 12.0) < 1e-9,
+          "高度基准 = 开始导航那一帧的实际高度（12 m，不是配置里的 30 m）");
+    // 下界 = max(12 - 10, min_flight_height=5) = 5，地图底 = 5 - margin(2) = 3，
+    // 所以 1 m 处已经在地图外；若没做最低离地高度约束，地图底会是 0，那里就在图内。
+    check(a4.gridMap()->getInflateOccupancy(Eigen::Vector3d(0.0, 0.0, 1.0)) == -1,
+          "高度带下界被最低离地高度顶起来（基准 12 m 时不贴着地面开图）");
+  }
+
+  // Validate the production vehicle envelope and actual inflated map, including
+  // the virtual floor/ceiling interactions after increasing rotor-tip clearance.
+  {
+    AppConfig app; std::string error;
+    const bool loaded = loadConfigFile(argv[1], app, error);
+    check(loaded, "生产安全间距参数可以加载: " + error);
+    if (loaded) {
+      const double inflated = std::ceil(app.adapter.obstacles_inflation / app.adapter.resolution) * app.adapter.resolution;
+      check(inflated - app.vehicle_radius >= 1.5, "生产栅格膨胀覆盖机体及至少 1.5 m 桨尖余量");
+      EgoPlannerAdapter production;
+      auto live = app.adapter; live.strict_pose_coverage = true;
+      const double altitude = app.mission_input.constant_alt_m;
+      production.init(live); production.prepareMap(altitude);
+      ego_sensor::TimedPose pose; pose.t = 1; pose.p = Eigen::Vector3d(0,0,altitude);
+      production.onPose(pose);
+      ego_sensor::LidarFrame frame; frame.t_base = 1;
+      ego_sensor::LidarPoint point; point.p = Eigen::Vector3d(8,0,0); frame.points.push_back(point);
+      production.onScanFrame(frame);
+      check(production.stats().inflate_samples == 1, "生产参数下点云成功入图");
+      auto map = production.gridMap();
+      check(map->getInflateOccupancy(pose.p) == 0, "增大膨胀后巡航高度不被虚拟地板封住");
+      const double floor = live.virtual_floor_height;
+      check(live.use_fixed_virtual_floor && std::abs(floor-3.0)<1e-9 &&
+            map->getInflateOccupancy(Eigen::Vector3d(0,0,floor-0.001)) == 1 &&
+            map->getInflateOccupancy(Eigen::Vector3d(0,0,floor)) == 0,
+            "固定地板膨胀后低于 3 m 被占用，3 m 开始可通行");
+      bool handover_free = true;
+      for (double offset : {-app.pilot.handover_alt_tolerance_m,0.0,app.pilot.handover_alt_tolerance_m})
+        handover_free = handover_free && map->getInflateOccupancy(Eigen::Vector3d(0,0,altitude+offset)) == 0;
+      check(handover_free, "接管窗口的上下边界和中心高度均可通行");
+      check(map->getInflateOccupancy(Eigen::Vector3d(30,30,floor-0.001)) == 1 &&
+            map->getInflateOccupancy(Eigen::Vector3d(30,30,floor)) == 0,
+            "未写入局部点云的地图区域也不能规划到 3 m 以下");
+      check(map->getInflateOccupancy(Eigen::Vector3d(0,0,altitude+10)) == 0 &&
+            map->getInflateOccupancy(Eigen::Vector3d(0,0,altitude+10.3)) == 1,
+            "虚拟顶板保持原有抬升边界");
+      const double unsafe = app.vehicle_radius + app.min_obstacle_gap - 0.001;
+      bool blocked = true;
+      for (int axis = 0; axis < 3; ++axis)
+        for (double direction : {-1.0, 1.0}) {
+          Eigen::Vector3d center(8,0,altitude); center[axis] += direction * unsafe;
+          blocked = blocked && map->getInflateOccupancy(center) == 1;
+        }
+      check(blocked, "六轴上桨尖不足 1.5 m 的中心位置均不可通行");
+      check(map->getInflateOccupancy(Eigen::Vector3d(8-inflated-.25,0,altitude)) == 0,
+            "膨胀边界外的已知空闲位置仍可通行");
+    }
+  }
+
+  // At 20 m/s, 10 ms samples can jump almost a full 0.25 m voxel;
+  // diagonal/overshooting splines can be faster still. Check spatial spacing.
+  {
+    Eigen::MatrixXd points = Eigen::MatrixXd::Zero(3, 7);
+    for (int i = 0; i < points.cols(); ++i) points(0, i) = 4.0 * i;
+    ego_planner::UniformBspline fast(points, 3, 0.1);
+    const double sample_dt = fast.collisionCheckInterval(0.25);
+    bool bounded = sample_dt < 0.01;
+    for (double t = 0; t + sample_dt <= fast.getTimeSum(); t += sample_dt)
+      bounded = bounded && (fast.evaluateDeBoorT(t + sample_dt) -
+                             fast.evaluateDeBoorT(t)).norm() <= 0.125 + 1e-9;
+    check(bounded, "高速样条碰撞采样间距不超过半个体素");
+    points.setZero();
+    ego_planner::UniformBspline stationary(points, 3, 0.1);
+    check(std::isfinite(stationary.collisionCheckInterval(0.25)), "零速样条碰撞采样间隔有效");
+    // Each axis is below 5 m/s, while the diagonal speed exceeds it.
+    for (int i = 0; i < points.cols(); ++i) points.col(i) = Eigen::Vector3d(0.4*i,0.4*i,0);
+    ego_planner::UniformBspline diagonal(points,3,0.1);
+    diagonal.setPhysicalLimits(5.0,4.0,0.05);
+    double ratio = 0;
+    check(!diagonal.checkFeasibility(ratio) && ratio > 1.1,
+          "斜向轨迹按总速度判定超限，不能仅检查各轴分量");
+  }
+
+  // Use the production YAML speed and mission height, with ideal position tracking, 50 Hz commands
+  // and 10 Hz scans. This checks the planning/map chain, not aircraft dynamics.
+  // 生产参数跑长航段：50 Hz 指令 + 10 Hz 雷达 + 理想位置跟随。
+  // 只检验"规划器 + 地图"链路在真实速度上限下不发散、不撞墙、能到终点，
+  // 不模拟机体动力学。
+  {
+    AppConfig app; std::string error;
+    if (loadConfigFile(argv[1], app, error)) {
+      EgoPlannerAdapter fast;
+      const double altitude = app.mission_input.constant_alt_m;
+      fast.init(app.adapter); fast.prepareMap(altitude);
+      Eigen::Vector3d position(0, 0, altitude);
+      const Eigen::Vector3d destination(350, 0, altitude);
+      fast.setLeg(position, destination, true);
+      double peak_speed = 0, next_frame = 0;
+      bool finite = true, collision_free = true;
+      const double pass_speed = std::min(app.adapter.local_target_speed, app.adapter.max_vel);
+      // 时间上限取 max(50 s, 2 倍直线飞行时间)：绕墙会多走路，
+      // 给足余量避免把"还在正常绕行"误判成超时失败。
+      const double simulation_limit_s = std::max(50.0, 2.0 * (destination-position).norm() / pass_speed);
+      for (double t = 0; t < simulation_limit_s; t += 1.0 / app.pilot.setpoint_hz) {
+        ego_sensor::TimedPose pose; pose.t = t; pose.p = position;
+        fast.onPose(pose);
+        if (t + 1e-9 >= next_frame) {
+          next_frame += app.lidar.frame_duration_s;
+          ego_sensor::LidarFrame frame; frame.t_base = t;
+          // A thin wall ahead; its inflated width fits the existing A* pool.
+          for (double y = -3; y <= 3; y += 1)
+            for (double z = altitude - 3; z <= altitude + 2; z += 1) {
+              ego_sensor::LidarPoint point;
+              point.p = Eigen::Vector3d(150, y, z) - position;
+              frame.points.push_back(point);
+            }
+          fast.onScanFrame(frame);
+        }
+        ego_planner::QuadrotorCommand command;
+        fast.step(t, position, command);
+        finite = finite && command.position.allFinite() && command.velocity.allFinite();
+        if (!finite) break;
+        peak_speed = std::max(peak_speed, command.velocity.norm());
+        const bool command_free = fast.gridMap()->getInflateOccupancy(command.position) == 0;
+        if (collision_free && !command_free)
+          std::printf("  [collision] t=%.3f current=(%.5f,%.5f,%.5f) target=(%.5f,%.5f,%.5f) current_occ=%d braking=%d\n",
+            t,position.x(),position.y(),position.z(),command.position.x(),command.position.y(),command.position.z(),
+            fast.gridMap()->getInflateOccupancy(position),fast.braking());
+        collision_free = collision_free && command_free;
+        position = command.position;
+        if ((position - destination).norm() < app.adapter.goal_tolerance) break;
+      }
+      std::printf("  [production %.1fm/s] peak=%.3f m/s end=(%.2f,%.2f,%.2f) plans=%d failures=%d max_plan=%.1f ms\n",
+                  app.adapter.max_vel, peak_speed, position.x(), position.y(), position.z(), fast.stats().replan,
+                  fast.stats().plan_fail, fast.stats().plan_ms_max);
+      check(finite && collision_free, "生产高速参数下指令有限且未进入膨胀障碍");
+      check(peak_speed >= pass_speed * 0.9, "长航段轨迹能达到接近期望通过速度");
+      check(peak_speed <= app.adapter.max_vel * 1.05 + 0.01, "高速轨迹未超出规划器 5% 可行性容差");
+      check((position - destination).norm() < 2, "高速轨迹绕障后抵达终点");
+      check(fast.stats().recenter > 0, "高速长航段触发地图滑窗");
+    } else check(false, "加载高速生产配置: " + error);
+  }
+
+  std::printf("\n%s (fail=%d)\n", g_fail == 0 ? "全部通过" : "存在失败", g_fail);
+  return g_fail == 0 ? 0 : 1;
+}

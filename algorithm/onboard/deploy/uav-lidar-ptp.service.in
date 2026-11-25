@@ -1,0 +1,27 @@
+[Unit]
+# 雷达专用网口与 PTP 主时钟服务，为点云时间戳提供统一时基。
+Description=UAV physical lidar network and PTP master
+# 等网络就绪后再配置网口，避免地址被网络管理覆盖。
+After=network-online.target
+Wants=network-online.target
+# 项目目录若为独立挂载，必须先挂载，否则脚本与配置文件不可用。
+RequiresMountsFor=@PROJECT_DIR@
+
+[Service]
+Type=simple
+# /etc/uav-onboard.env 提供 UAV_LIDAR_IFACE 等机位相关变量。
+EnvironmentFile=/etc/uav-onboard.env
+WorkingDirectory=@PROJECT_DIR@
+# 启动前幂等配置雷达网口地址与主机路由，不修改默认路由。
+ExecStartPre=/bin/bash "@PROJECT_DIR@/algorithm/onboard/scripts/setup_lidar_network.sh" ${UAV_LIDAR_IFACE}
+# ptp4l 在该网口以 master 身份发时钟；-m 表示日志输出到标准输出。
+ExecStart=/usr/sbin/ptp4l -i ${UAV_LIDAR_IFACE} -f "@PROJECT_DIR@/algorithm/onboard/deploy/ptp4l-master.conf" -m
+# 非正常退出后自动重启，使时间同步中断可自恢复。
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uav-lidar-ptp
+
+[Install]
+WantedBy=multi-user.target

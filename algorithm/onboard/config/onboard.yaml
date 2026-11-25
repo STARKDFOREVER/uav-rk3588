@@ -1,0 +1,128 @@
+# 板载系统参数
+lidar:
+  crc_policy: mid360s_sample # 当前设备点云 CRC=0；视为未提供，不当作 CRC 校验成功
+  # 只接受该序列号的雷达，防止接错或混入其他设备。
+  expected_serial: ARMCP8H0037373
+  point_data_type: 1         # 实测 Cartesian High，96 点 × 14 字节 + 36 字节头 = 1380
+  frame_duration_s: 0.10     # 约 100 ms/帧，输出约 10 Hz
+  gap_factor: 2.0            # 回跳/包间大缺口仍清理半帧
+  min_range_m: 1.24
+  max_range_m: 100.0        # 截止量程，仅用于点云过滤
+  planning_range_m: 40.0    # 10% 反射率典型量程，用于规划/制动预算；并非保证探测距离
+  # 点云帧队列容量，满时丢弃最旧帧以保持实时性。
+  queue_capacity: 3
+
+# 飞控协议身份与链路
+mavlink:
+  sysid: 245                 # 板载计算机的系统 ID
+  # 板载计算机的组件 ID。
+  compid: 1
+  target_system: 1           # 飞机 ID（多机时各不相同）
+  # 飞控侧的组件 ID，通常为 1。
+  target_component: 1
+  heartbeat_hz: 1.0          # GCS 心跳频率
+  link_timeout: 3.0          # 多久收不到飞控心跳算失联（巡航中触发即报错）
+
+# 上电等待接收路径；文件出现后立即读取并解析，成功后自动启动一条任务。
+mission_input:
+  file: "missions/mission.kml" # 相对启动工作目录；开机服务固定为项目根目录
+  wait_for_file: true
+  constant_alt_m: 5.0        # 全程固定巡航高度，相对 HOME（m）
+  # KML 文件大小上限（字节），超出即拒绝。
+  max_bytes: 5242880
+  # 航点数量上限，超出即拒绝。
+  max_waypoints: 2000
+# 任务接管门限与执行策略
+mission:
+  handover_position_tolerance_m: 8.0 # 起点水平误差超过此值不接管
+  handover_alt_tolerance_m: 2.0 # 起飞点预定高度的 ±2 m（含边界）
+  handover_stable_s: 1.5       # 定点低速且满足接管条件的连续时长
+  handover_max_speed_mps: 0.3  # 三维速度低于此值才认为悬停稳定
+  # 航点水平到达判定半径（m）。
+  wp_reach_tol: 2.0
+  pre_offboard_stream_s: 1.5  # 稳定悬停后预发 setpoint，再请求切换
+  # true 使用 EGO 规划器输出；false 时不调用规划器、保持悬停（调试用）。
+  use_planner: true
+
+# 报文提频（协议 2.5.1，req_stream_id = 报文 ID）
+streaming:
+  # 是否主动向飞控发送提频请求。
+  request_rates: true
+  global_position_hz: 50     # GLOBAL_POSITION_INT(33)
+  attitude_hz: 100           # ATTITUDE(30)
+  extension_hz: 10           # EXTENDED_SYS_STATE(245)
+
+# 位置采用最新真实位置+速度外推，新定位到达后更换锚点，不等第二帧。
+timing:
+  position_extrapolation_s: 0.25
+
+# 异常处理：统一进安全悬停
+failsafe:
+  gps:
+    # 是否启用 GPS 质量监控。
+    enabled: true
+    min_fix: 6               # 0/1 无定位、2 仅 2D、3 起可用、5 RTK 浮动、6 RTK 固定
+    loss_confirm_s: 0.5      # 连续无效多久判丢星
+    rx_timeout_s: 2.0        # 收不到 GPS_RAW_INT 也按丢星处理
+  sensing:
+    # 是否启用感知链路（雷达/地图）监控。
+    enabled: true
+    timeout_s: 0.5           # 没有首帧/雷达断流/地图过期也判失效
+    drop_frames: 10          # 连续丢多少帧（10 Hz 下 ≈1 s）判感知失效
+  hold_recover_confirm_s: 2.0 # 异常全部清除后稳定多久恢复巡航
+
+# 输出形态
+output:
+  setpoint_hz: 50.0          # 5 m/s 时相邻设定点约 0.1 m
+  velocity_feedforward: false # false = 只发位置+yaw（type_mask 0x09F8）
+
+# 机体
+vehicle:
+  # 机体半径（m），用于障碍膨胀与安全间距计算。
+  radius: 1.24
+  # 期望的最小避障间隙（m）。
+  min_obstacle_gap: 1.5
+
+# 地图
+map:
+  # 栅格分辨率（m/格）。
+  resolution: 0.25
+  size_xy: [108.0, 108.0]    # 半宽 54 m 覆盖 8 m 滑窗偏移 + 40 m 入图及膨胀余量
+  virtual_floor_height: 3.0  # 膨胀后的机体中心高度下界，相对 HOME
+  virtual_ceiling_height: 10.0 # 膨胀后的机体中心高度上界，相对 HOME
+  # 垂直方向地图余量（m）。
+  map_margin_z: 3.25
+  update_range_xy: 40.0      # 按典型量程入图；不依赖 40～100 m 的远距回波完成制动
+  update_range_z: 10.0
+  # 障碍物膨胀半径（m），含机体半径与安全余量。
+  obstacles_inflation: 2.75
+  # 局部地图向外扩展的格数。
+  local_map_margin: 10
+  recenter_margin: 8.0       # 离窗口中心 8 m 滑动
+
+# 规划器
+planner:
+  max_vel: 5.0              # m/s；EGO 轨迹速度上限
+  local_target_speed: 3.0   # m/s；局部前视点的期望通过速度
+  # m/s²；EGO 轨迹加速度上限。
+  max_acc: 4.0
+  planning_horizon: 7.5     # m；5 m/s、4 m/s² 下理想制动 3.125 m，含延迟及膨胀需 10.725 m
+  # 沿线枚举局部目标点的步长（m）。
+  local_target_step: 0.5
+  # 局部目标最远距离 = 该比例 × planning_horizon。
+  local_target_max_ratio: 1.5
+  replan_period: 0.2         # 每个重规划周期前进约 1 m
+  # 到达局部目标点的判定距离（m）。
+  goal_tolerance: 0.5
+  # 轨迹与障碍物需保持的最小间隙（m）。
+  obstacle_clearance: 0.5
+  ctrl_pt_dist: 0.4          # 随速度减半，保持控制点时间尺度
+  time_forward: 1.0         # yaw 前视约 5 m
+  # A* 搜索池尺寸（x/y/z 方向节点数）。
+  astar_pool: [100, 100, 100]
+
+# 外参：雷达 -> 机体
+# R 为行优先 3×3 旋转矩阵，t 为平移（m）；默认无旋转无偏移。
+extrinsic:
+  R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  t: [0.0, 0.0, 0.0]
