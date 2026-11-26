@@ -301,8 +301,8 @@ namespace ego_mav
   // 飞行主模式（COMMAND_LONG command=176 的 param2）
   enum MainMode
   {
-    MODE_ALT_HOLD = 2, // 定高
-    MODE_POS_HOLD = 3, // 定点
+    MODE_POS_HOLD = 2, // 定点
+    MODE_ALT_HOLD = 3, // 定高
     MODE_AUTO = 4,     // 自动（任务/返航/降落都在这一档的细分里）
     MODE_OFFBOARD = 6, // Offboard ← 我们接管用的
   };

@@ -29,13 +29,11 @@ int main() {
   // 合成时间 1s→1000s：长时间无文件仍应保持 WAIT_KML 且不产生任务。
   input.step(1);input.step(1000);
   check(input.state()==MissionInputState::WAIT_KML&&input.mission().route.empty(),"missing KML waits indefinitely without a task");
-  // 写入“有 XML 但结构不完整”的内容，模拟传输中的半成品。
   write(path,"<kml>");input.step(1001);input.step(1001.4);
   check(input.state()==MissionInputState::PARSING_KML,"a file is read immediately when it appears");
   // 解析失败是终态：错误被记录，任务保持为空。
   input.step(1001.6);
   check(input.state()==MissionInputState::FAILED&&!input.error().empty()&&input.mission().route.empty(),"invalid KML fails terminally without a task");
-  // 重新 start 后再投递合法文件：应自动装载一条闭合任务。
   input.start(cfg);
   write(temporary,valid);std::rename(temporary.c_str(),path.c_str());
   input.step(1011);input.step(1011.6);input.step(1011.6);
