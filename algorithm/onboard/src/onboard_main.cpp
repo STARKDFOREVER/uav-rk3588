@@ -209,12 +209,24 @@ int main(int argc,char **argv) {
       if(report_tick) {
         last_report=now; const auto st=async->stats(); const auto &ls=lidar_status; const auto &ts=pilot.timeAlignment();
         const uint64_t crc=pilot.crcErrors();
+        const bool link_waiting=pilot.phase()==Phase::LINK;
+        std::string link_status;
+        if(link_waiting) {
+          std::string missing;
+          if(!hd.fc_alive) missing+="HEARTBEAT,";
+          if(!hd.home_valid) missing+="HOME,";
+          if(!hd.position_received) missing+="POSITION,";
+          if(!missing.empty()) {
+            missing.pop_back();
+            link_status=" link_missing="+missing;
+          }
+        }
         rec.flush();
-        std::printf("[STATUS] t=%.1f %s GPS=%u pose=%d sync=%d n=%d RTT=%.2fms reject=%llu lidar=%llu type=%u ptp=%d aligned=%llu map=%d loop_max=%.1fms CRC=%llu\n",now-begin,phaseName(pilot.phase()),pilot.gpsFixType(),pose_ok,clock_ok,ts.samples(),ts.rtt()*1000,(unsigned long long)ts.rejected(),(unsigned long long)ls.packets,ls.time_type,ptp_ready,(unsigned long long)aligned,st.inflate_samples,max_loop*1000,(unsigned long long)crc);
-        std::printf("[HANDOVER] phase=%s ready=%d stable=%.2fs fc=%d armed=%d mode=%u/%u pose=%d timing=%d sensing=%d gps=%d route=%d xy=%.2fm/%d alt=%.2fm/%d speed=%.2fmps/%d ack=%d/%u age=%.2fs\n",
+        std::printf("[STATUS] t=%.1f %s GPS=%u pose=%d sync=%d n=%d RTT=%.2fms reject=%llu lidar=%llu type=%u ptp=%d aligned=%llu map=%d loop_max=%.1fms CRC=%llu%s\n",now-begin,phaseName(pilot.phase()),pilot.gpsFixType(),pose_ok,clock_ok,ts.samples(),ts.rtt()*1000,(unsigned long long)ts.rejected(),(unsigned long long)ls.packets,ls.time_type,ptp_ready,(unsigned long long)aligned,st.inflate_samples,max_loop*1000,(unsigned long long)crc,link_status.c_str());
+        std::printf("[HANDOVER] phase=%s ready=%d stable=%.2fs fc=%d armed=%d mode=%u/%u pose=%d timing=%d sensing=%d gps=%d route=%d xy=%.2fm/%d alt=%.2fm/%d speed=%.2fmps/%d ack=%d/%u age=%.2fs%s\n",
           phaseName(pilot.phase()),hd.ready,hd.ready_stable_s,hd.fc_alive,hd.armed,unsigned(hd.main_mode),unsigned(hd.sub_mode),
           hd.pose_ok,hd.timing_ok,hd.sensing_ok,hd.gps_ok,hd.route_valid,hd.horizontal_error_m,hd.horizontal_position_ok,
-          hd.altitude_rel_m,hd.altitude_ok,hd.speed_mps,hd.speed_ok,hd.mode_ack_seen,unsigned(hd.mode_ack_result),hd.mode_ack_age_s);
+          hd.altitude_rel_m,hd.altitude_ok,hd.speed_mps,hd.speed_ok,hd.mode_ack_seen,unsigned(hd.mode_ack_result),hd.mode_ack_age_s,link_status.c_str());
         rusage memory{}; getrusage(RUSAGE_SELF, &memory);
         std::printf("[EGO] trajectory=%d plans_ok=%llu plans_fail=%d optimizations=%llu astar_ok=%llu/%llu tracked=%llu holds=%llu sent=%llu cruise_holds=%llu plan_last=%.1fms plan_max=%.1fms rss_peak=%.1fMiB\n",
           st.trajectory_active,(unsigned long long)st.plan_success,st.plan_fail,
@@ -223,7 +235,7 @@ int main(int argc,char **argv) {
           (unsigned long long)st.hold_commands,(unsigned long long)pilot.plannerSetpoints(),
           (unsigned long long)pilot.cruiseHoldSetpoints(),st.last_plan_ms,st.plan_ms_max,memory.ru_maxrss/1024.0);
         rec.timing({now-begin,phaseName(pilot.phase()),int(pilot.gpsFixType()),clock_ok,(uint64_t)ts.samples(),ts.rtt()*1000,ts.residual()*1000,ls.packets,int(ls.time_type),aligned,rejected,st.inflate_samples,pose_ok,max_loop*1000,crc,ptp_ready,ls.time_offset_ns,ls.crc_missing,st.step_calls});
-
+        if(link_waiting) std::fflush(stdout);
       }
       // GPS 丢星期间把推算位置写入本地文件，供事后分析（内部 1 Hz 限频）。
       if(rec.gpsLossDue(now)&&!pilot.gpsOk(now)) {

@@ -8,6 +8,11 @@
 
 namespace ego_onboard
 {
+  namespace
+  {
+    constexpr double kOffboardRetryIntervalS = 0.3;
+    constexpr double kOffboardConfirmTimeoutS = 3.0;
+  }
 
   const char *phaseName(Phase p)
   {
@@ -79,8 +84,7 @@ namespace ego_onboard
     t_handover_candidate_ = -1e9;
     err_.clear();
     phase_ = Phase::LINK;
-    t_start_ = -1.0;
-    t_phase_ = 0.0;
+    t_phase_ = -1.0;
 
     // GPS 健康状态
     gps_fix_type_ = 0;
@@ -351,6 +355,8 @@ namespace ego_onboard
   {
     HandoverDiagnostics d;
     d.fc_alive = h.fc_alive;
+    d.home_valid = origin_.valid;
+    d.position_received = have_pos_;
     d.armed = armed_;
     d.main_mode = main_mode_;
     d.sub_mode = sub_mode_;
@@ -363,7 +369,7 @@ namespace ego_onboard
     d.route_valid = !route_enu_.empty();
     d.altitude_rel_m = pos_enu_.z();
     d.speed_mps = pose_asm_.velocityEnu().norm();
-    d.phase_elapsed_s = std::max(0.0, now - t_phase_);
+    d.phase_elapsed_s = t_phase_ < 0.0 ? 0.0 : std::max(0.0, now - t_phase_);
     d.ready_stable_s = t_handover_candidate_ < -1e8 ? 0.0 :
         std::max(0.0, now - t_handover_candidate_);
     d.mode_switch_sent = mode_switch_sent_;
@@ -391,8 +397,8 @@ namespace ego_onboard
   void OffboardPilot::tick(double now, std::vector<std::vector<uint8_t>> &out)
   {
     t_now_ = now;
-    if (t_start_ < 0)
-      t_start_ = now;
+    if (phase_ == Phase::LINK && t_phase_ < 0.0)
+      t_phase_ = now;
 
     // 先吐出接收路径上攒下的帧
     for (auto &f : outbox_)
@@ -447,11 +453,7 @@ namespace ego_onboard
     {
       if (health.fc_alive) requestRatesOnce(out);
       if (!health.fc_alive || !origin_.valid || !have_pos_)
-      {
-        if (now - t_start_ > 30.0)
-          fail("link/home/position timeout");
         break;
-      }
       // 参考航线（ENU，原点 = home）
       route_enu_.clear();
       for (const auto &w : route_)
@@ -495,7 +497,7 @@ namespace ego_onboard
     {
       // 预发 setpoint 期间若飞机离开高度窗、出现异常或掉出定点/Offboard，退回等待阶段重新计时。
       const bool outside_handover_window = !mode_switch_sent_ && !health.altitude_ok;
-      if (!health.all_clear || !armed_ || outside_handover_window ||
+      if (!health.fc_alive || !health.all_clear || !armed_ || outside_handover_window ||
           (main_mode_ != MODE_POS_HOLD && main_mode_ != MODE_OFFBOARD))
       {
         // Restart the hover check if the aircraft leaves the height window before the request.
@@ -505,29 +507,43 @@ namespace ego_onboard
         waiting_offboard_ = false;
         break;
       }
-      if (now - t_last_setpoint_ < 1.0 / cfg_.setpoint_hz) break;
       // 从当前位姿起步（速度/加速度为 0），避免切模式瞬间位置跳变
-      if (!emitHoldSetpoint(now, pos_enu_, out)) { fail("nonfinite control target"); break; }
+      if (now - t_last_setpoint_ >= 1.0 / cfg_.setpoint_hz &&
+          !emitHoldSetpoint(now, pos_enu_, out)) { fail("nonfinite control target"); break; }
 
-      if (!mode_switch_sent_ && now - t_phase_ >= cfg_.pre_offboard_stream_s)
+      if (!mode_switch_sent_)
       {
-        send(CommandLong::setMode(MODE_OFFBOARD, 0, cfg_.target_system), out);
-        t_cmd_sent_ = now;
+        if (now - t_phase_ < cfg_.pre_offboard_stream_s) break;
+        t_first_mode_request_ = now;
+        mode_switch_confirmation_ = 0;
         mode_switch_sent_ = true;
         waiting_offboard_ = true;
         mode_ack_seen_ = false;
         mode_ack_result_ = 255;
         t_last_mode_ack_ = -1e9;
       }
-      if (waiting_offboard_ && main_mode_ == MODE_OFFBOARD)
+      else if (main_mode_ == MODE_OFFBOARD)
       {
         // 以飞控回报的主模式为准（而不是依赖 COMMAND_ACK），确认已进入 Offboard 才算接管成功。
         waiting_offboard_ = false;
         phase_ = Phase::OFFBOARD_CRUISE;
         t_phase_ = now;
+        break;
       }
-      else if (mode_switch_sent_ && now - t_cmd_sent_ > 3.0)
+      else if (now - t_first_mode_request_ >= kOffboardConfirmTimeoutS)
+      {
         fail("enter offboard timeout");
+        break;
+      }
+      else if (now - t_last_mode_request_ < kOffboardRetryIntervalS)
+      {
+        break;
+      }
+
+      auto command = CommandLong::setMode(MODE_OFFBOARD, 0, cfg_.target_system);
+      command.confirmation = mode_switch_confirmation_++;
+      send(command, out);
+      t_last_mode_request_ = now;
       break;
     }
 

@@ -88,6 +88,7 @@ namespace ego_onboard
     bool mode_ack_seen = false;
     uint8_t mode_ack_result = 255;
     double mode_ack_age_s = -1.0;
+    bool home_valid = false, position_received = false;
   };
 
   // Offboard 飞行主控。
@@ -109,9 +110,9 @@ namespace ego_onboard
       // 任务
       double cruise_alt_m = 50.0; // 仅用于地面站起飞后接管的高度检查
       double handover_alt_tolerance_m = 2.0;      // 接管高度允许误差
-      double handover_position_tolerance_m = 5.0; // 接管水平位置允许误差
+      double handover_position_tolerance_m = 15.0; // 接管水平位置允许误差
       double handover_stable_s = 1.5;             // 高度/位置和悬停速度连续满足的时间
-      double handover_max_speed_mps = 0.3;        // 认为已悬停的最大三维速度
+      double handover_max_speed_mps = 0.8;        // 认为已悬停的最大三维速度
       double wp_reach_tol = 1.5;     // 航点到达判定
 
       // 提频
@@ -133,16 +134,17 @@ namespace ego_onboard
       // 输出形态：位置 + yaw 必发；速度前馈可选。
       bool velocity_feedforward = false; // 是否在 setpoint 里带速度前馈
       double pose_timeout_s = 0.25;      // 位姿超过多久算不新鲜
-      double position_extrapolation_s = 0.25; // 单帧位置+速度外推的有效时长；新位置立即换锚点
+      double position_extrapolation_s = 0.5; // 单帧位置+速度外推的有效时长；新位置立即换锚点
       double setpoint_hz = 20.0;         // setpoint 发送频率
       
     };
 
+    OffboardPilot() { setConfig(Config{}); }
     void setPlanner(PlannerIO *p) { planner_ = p; }
     void setConfig(const Config &c) { cfg_ = c; PoseAssemblerConfig pc; pc.max_position_extrapolation_s=c.position_extrapolation_s; pose_asm_.setConfig(pc); }
 
     // 航线以「第 1 个航点 = 起飞点」约定传入（与 KML 一致）
-    // 进入 LINK 阶段；t_start_ = -1 表示还没开始正式巡航计时
+    // 进入 LINK 阶段，在首个 tick 开始计时
     void start(const std::vector<GeoWaypoint> &route);
     // 由主循环每拍注入统一时钟（tick 与报文处理都用这个时刻）
     void setReceiveTime(double now) { t_now_ = now; }
@@ -264,14 +266,14 @@ namespace ego_onboard
     // MAVLink 包序号，按 uint8_t 自然回绕
     uint8_t seq_ = 0;
 
-    double t_start_ = 0.0;  // 本次任务开始时刻
     double t_phase_ = 0.0;  // 进入当前阶段的时刻
     double t_handover_candidate_ = -1e9;
     double t_last_hb_ = -1e9;
     double t_last_fc_hb_ = -1e9;
     double t_last_setpoint_ = -1e9;
     uint64_t planner_setpoints_ = 0, cruise_hold_setpoints_ = 0;
-    double t_cmd_sent_ = -1e9;
+    double t_first_mode_request_ = -1e9, t_last_mode_request_ = -1e9;
+    uint8_t mode_switch_confirmation_ = 0;
     bool mode_switch_sent_ = false; // 是否已发过切 Offboard 的 COMMAND_LONG
     bool waiting_offboard_ = false; // 已请求切换，正在等飞控确认
     bool mode_ack_seen_ = false;

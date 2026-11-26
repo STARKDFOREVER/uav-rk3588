@@ -34,10 +34,10 @@ mission_input:
   max_waypoints: 2000
 # 任务接管门限与执行策略
 mission:
-  handover_position_tolerance_m: 8.0 # 起点水平误差超过此值不接管
+  handover_position_tolerance_m: 15.0 # 起点水平误差超过此值不接管
   handover_alt_tolerance_m: 2.0 # 起飞点预定高度的 ±2 m（含边界）
   handover_stable_s: 1.5       # 定点低速且满足接管条件的连续时长
-  handover_max_speed_mps: 0.3  # 三维速度低于此值才认为悬停稳定
+  handover_max_speed_mps: 0.8  # 三维速度不超过此值才认为悬停稳定
   # 航点水平到达判定半径（m）。
   wp_reach_tol: 2.0
   pre_offboard_stream_s: 1.5  # 稳定悬停后预发 setpoint，再请求切换
@@ -52,7 +52,7 @@ streaming:
 
 # 位置采用最新真实位置+速度外推，新定位到达后更换锚点，不等第二帧。
 timing:
-  position_extrapolation_s: 0.25
+  position_extrapolation_s: 0.5
 
 # 异常处理：统一进安全悬停
 failsafe:
